@@ -1,6 +1,13 @@
+process.on('uncaughtException', (e) => { console.error('UNCAUGHT:', e); process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error('UNHANDLED:', e); process.exit(1); });
+
+console.log('Iniciando servidor...');
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+
+console.log('Módulos cargados OK');
 
 const app = express();
 app.use(cors());
@@ -11,35 +18,31 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "signalbot2024";
 
-// ── HMAC ──────────────────────────────────────────────────
+console.log('Config:', { PORT, hasTelegram: !!TELEGRAM_TOKEN });
+
 function hmac(secret, message) {
   return crypto.createHmac("sha256", secret).update(message).digest("hex");
 }
 
-// ── Telegram ──────────────────────────────────────────────
 async function sendTelegram(message) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.log('Telegram no configurado'); return; }
   try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: "HTML"
-      })
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" })
     });
+    const d = await r.json();
+    console.log('Telegram response:', d.ok);
   } catch (e) {
     console.log("Telegram error:", e.message);
   }
 }
 
-// ── Health check ──────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "Signal Bot Backend OK", time: new Date().toISOString() });
 });
 
-// ── Get balance ───────────────────────────────────────────
 app.post("/balance", async (req, res) => {
   const { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret) return res.status(400).json({ error: "Faltan claves" });
@@ -53,16 +56,12 @@ app.post("/balance", async (req, res) => {
     const data = await response.json();
     if (data.code) return res.status(400).json({ error: data.msg });
     const usdt = data.balances?.find(b => b.asset === "USDT");
-    res.json({ 
-      usdt: usdt ? parseFloat(usdt.free) : 0,
-      balances: data.balances?.filter(b => parseFloat(b.free) > 0)
-    });
+    res.json({ usdt: usdt ? parseFloat(usdt.free) : 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── Place order ───────────────────────────────────────────
 app.post("/order", async (req, res) => {
   const { apiKey, apiSecret, symbol, side, quantity, type = "MARKET" } = req.body;
   if (!apiKey || !apiSecret || !symbol || !side || !quantity) {
@@ -79,24 +78,14 @@ app.post("/order", async (req, res) => {
     });
     const data = await response.json();
     if (data.code) return res.status(400).json({ error: data.msg });
-    
-    // Enviar alerta Telegram
-    const msg = `🔔 <b>ORDEN EJECUTADA</b>\n📊 ${symbol}\n${side === 'BUY' ? '▲ COMPRA' : '▼ VENTA'}\n💰 Cantidad: ${data.executedQty}\n💵 Precio: $${data.fills?.[0]?.price || 'MARKET'}\n🆔 ID: ${data.orderId}`;
+    const msg = `🔔 ORDEN EJECUTADA\n${symbol} ${side}\nCantidad: ${data.executedQty}`;
     await sendTelegram(msg);
-    
-    res.json({ 
-      success: true, 
-      orderId: data.orderId, 
-      executedQty: data.executedQty, 
-      price: data.fills?.[0]?.price,
-      status: data.status
-    });
+    res.json({ success: true, orderId: data.orderId, executedQty: data.executedQty, price: data.fills?.[0]?.price });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── Send alert ────────────────────────────────────────────
 app.post("/alert", async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: "Falta mensaje" });
@@ -104,12 +93,9 @@ app.post("/alert", async (req, res) => {
   res.json({ success: true });
 });
 
-// ── TradingView webhook ───────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const { secret, action, symbol, quantity, apiKey, apiSecret } = req.body;
-  if (secret !== WEBHOOK_SECRET) {
-    return res.status(401).json({ error: "Webhook secret inválido" });
-  }
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Secret inválido" });
   try {
     const side = action === "buy" ? "BUY" : "SELL";
     const timestamp = Date.now();
@@ -121,8 +107,7 @@ app.post("/webhook", async (req, res) => {
       body: `${params}&signature=${signature}`
     });
     const data = await response.json();
-    
-    await sendTelegram(`🎯 <b>WEBHOOK TV</b>\n${side} ${symbol}\nCantidad: ${quantity}`);
+    await sendTelegram(`WEBHOOK: ${side} ${symbol}`);
     res.json({ success: true, order: data });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -130,6 +115,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Backend corriendo en puerto ${PORT}`);
-  sendTelegram(`🟢 <b>Signal Bot Backend iniciado</b>\n⏰ ${new Date().toLocaleString('es-AR')}`);
+  console.log(`Servidor escuchando en puerto ${PORT}`);
+  sendTelegram(`🟢 Signal Bot Backend iniciado\n${new Date().toLocaleString('es-AR')}`);
 });

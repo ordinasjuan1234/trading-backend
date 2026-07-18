@@ -115,6 +115,89 @@ function calcATR(h, l, c, p = 14) {
   return atr / p;
 }
 
+function calcRSISeries(c, p = 14) {
+  const rsiValues = [];
+  for (let i = p; i < c.length; i++) {
+    let g = 0, l = 0;
+    for (let j = i - p + 1; j <= i; j++) {
+      const d = c[j] - c[j-1];
+      if (d >= 0) g += d; else l -= d;
+    }
+    const ag = g / p, al = l / p;
+    rsiValues.push(al === 0 ? 100 : 100 - 100 / (1 + ag / al));
+  }
+  return rsiValues;
+}
+function calcMACDSeries(c) {
+  const macdLine = [];
+  for (let i = 26; i <= c.length; i++) {
+    const slice = c.slice(0, i);
+    const e12 = calcEMA(slice, 12), e26 = calcEMA(slice, 26);
+    if (e12 && e26) macdLine.push(e12 - e26);
+  }
+  return macdLine;
+}
+function calcVolatilityRank(c, lookback = 50) {
+  if (c.length < lookback + 14) return 0.5;
+  const atrs = [];
+  for (let i = c.length - lookback; i < c.length; i++) {
+    const window = c.slice(Math.max(0, i - 14), i);
+    if (window.length < 14) continue;
+    const range = Math.max(...window) - Math.min(...window);
+    atrs.push(range);
+  }
+  const current = atrs[atrs.length - 1];
+  const sorted = [...atrs].sort((a, b) => a - b);
+  const rank = sorted.indexOf(current) / sorted.length;
+  return rank;
+}
+
+function analyzeImproved(closes, highs, lows) {
+  if (!closes || closes.length < 210) return null;
+  const price = closes[closes.length - 1];
+  const sma200Now = calcSMA(closes, 200);
+  const sma200Before = calcSMA(closes.slice(0, -10), 200);
+  const trendUp = sma200Now && sma200Before && sma200Now > sma200Before;
+  const trendDown = sma200Now && sma200Before && sma200Now < sma200Before;
+  const rsiSeries = calcRSISeries(closes, 14);
+  const rsi = rsiSeries[rsiSeries.length - 1];
+  const rsiPrev = rsiSeries[rsiSeries.length - 2];
+  const rsiTurningUp = rsi > rsiPrev;
+  const rsiTurningDown = rsi < rsiPrev;
+  const macdSeries = calcMACDSeries(closes);
+  const macdNow = macdSeries[macdSeries.length - 1];
+  const macdPrev = macdSeries[macdSeries.length - 2];
+  const macdCrossUp = macdPrev < 0 && macdNow > macdPrev;
+  const macdCrossDown = macdPrev > 0 && macdNow < macdPrev;
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (rsi < 40 && rsiTurningUp) bull += 3; else if (rsi < 40) bull += 1;
+  if (rsi > 60 && rsiTurningDown) bear += 3; else if (rsi > 60) bear += 1;
+  if (macdCrossUp) bull += 2;
+  if (macdCrossDown) bear += 2;
+  if (trendUp) bull += 2;
+  if (trendDown) bear += 2;
+  if (ema20) { if (price > ema20) bull += 1; else bear += 1; }
+  if (ema50) { if (price > ema50) bull += 1; else bear += 1; }
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  if (diff >= 4 && isVolatileEnough && !trendDown) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && !trendUp) { signal = 'VENDER'; direction = 'SHORT'; }
+  let entry = price, tp, sl;
+  const slMultiplier = 1.5, tpMultiplier = 3.0;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr };
+}
+
 function analyze(closes, highs, lows) {
   if (!closes || closes.length < 30) return null;
   const price = closes[closes.length - 1];
@@ -423,15 +506,17 @@ async function fetchHistoricalCandles(pair, tf, days) {
 }
 
 function runBacktestEngine(candles, config) {
-  const { minConfidence, riskPct, initialCapital } = config;
+  const { minConfidence, riskPct, initialCapital, strategy = 'original' } = config;
+  const analyzeFn = strategy === 'improved' ? analyzeImproved : analyze;
+  const minHistory = strategy === 'improved' ? 210 : 200;
   let capital = initialCapital;
   let trades = [];
   let openTrade = null;
   let peakCapital = initialCapital;
   let maxDrawdown = 0;
   
-  for (let i = 200; i < candles.length; i++) {
-    const window = candles.slice(Math.max(0, i - 200), i + 1);
+  for (let i = minHistory; i < candles.length; i++) {
+    const window = candles.slice(Math.max(0, i - minHistory), i + 1);
     const closes = window.map(c => c.close);
     const highs = window.map(c => c.high);
     const lows = window.map(c => c.low);
@@ -461,7 +546,7 @@ function runBacktestEngine(candles, config) {
       continue;
     }
     
-    const a = analyze(closes, highs, lows);
+    const a = analyzeFn(closes, highs, lows);
     if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
       const size = capital * riskPct;
       openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence };
@@ -485,16 +570,16 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000 } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original' } = req.body;
   try {
     const candles = await fetchHistoricalCandles(pair, tf, days);
     if (candles.length < 250) {
       return res.status(400).json({ error: 'No hay suficientes datos históricos para este período' });
     }
-    const result = runBacktestEngine(candles, { minConfidence, riskPct, initialCapital });
+    const result = runBacktestEngine(candles, { minConfidence, riskPct, initialCapital, strategy });
     res.json({
       success: true,
-      config: { pair, tf, days, minConfidence, riskPct, initialCapital },
+      config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
       dataRange: { from: new Date(candles[0].time).toISOString(), to: new Date(candles[candles.length-1].time).toISOString(), totalCandles: candles.length },
       result
     });

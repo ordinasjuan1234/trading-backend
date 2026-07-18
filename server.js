@@ -31,10 +31,10 @@ function loadState() {
     dailyTrades: 0,
     openTrade: null,
     autoMode: false,
-    autoPairs: ["BTCUSDT"],
-    autoTFs: ["15m", "1h"],
+    autoPairs: ["BTCUSDT", "ETHUSDT"], // Validated by backtest: positive results in 180 days
+    autoTFs: ["4h"], // Validated by backtest: 4h gives best results vs 15m/1h
     minConfidence: 70,
-    requireMTF: true,
+    requireMTF: false, // Only one TF now (4h), so multi-TF confirmation not needed
     maxDailyGainPct: 5,
     maxDailyLossPct: 3,
     consecutiveLosses: 0,
@@ -323,8 +323,9 @@ async function runAutoCheck() {
     let signals = [];
     for (const tf of state.autoTFs) {
       try {
-        const { closes, highs, lows } = await fetchKlines(pair, tf, 100);
-        const a = analyze(closes, highs, lows);
+        // Improved strategy needs more history (210 candles) for SMA200 trend filter
+        const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
+        const a = analyzeImproved(closes, highs, lows);
         if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }

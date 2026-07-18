@@ -397,6 +397,112 @@ function sendDailySummaryMsg() {
   saveState(state);
 }
 
+// ── Backtest Engine ───────────────────────────────────────
+async function fetchHistoricalCandles(pair, tf, days) {
+  const limit = 1000;
+  const tfMs = { '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
+  const totalCandles = Math.min(Math.ceil((days * 86400000) / tfMs), 5000); // cap for safety
+  let allCandles = [];
+  let endTime = Date.now();
+  
+  while (allCandles.length < totalCandles) {
+    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}&endTime=${endTime}`);
+    if (!res.ok) throw new Error('Binance fetch failed: ' + res.status);
+    const data = await res.json();
+    if (data.length === 0) break;
+    allCandles = data.concat(allCandles);
+    endTime = data[0][0] - 1;
+    if (data.length < limit) break;
+    if (allCandles.length >= totalCandles) break;
+  }
+  
+  return allCandles.map(k => ({
+    time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4])
+  }));
+}
+
+function runBacktestEngine(candles, config) {
+  const { minConfidence, riskPct, initialCapital } = config;
+  let capital = initialCapital;
+  let trades = [];
+  let openTrade = null;
+  let peakCapital = initialCapital;
+  let maxDrawdown = 0;
+  
+  for (let i = 200; i < candles.length; i++) {
+    const window = candles.slice(Math.max(0, i - 200), i + 1);
+    const closes = window.map(c => c.close);
+    const highs = window.map(c => c.high);
+    const lows = window.map(c => c.low);
+    const current = candles[i];
+    
+    if (openTrade) {
+      let closed = false, exitPrice = null, reason = null;
+      if (openTrade.signal === 'COMPRAR') {
+        if (current.high >= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.low <= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      } else {
+        if (current.low <= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.high >= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      }
+      if (closed) {
+        const pricePct = openTrade.signal === 'COMPRAR' 
+          ? (exitPrice - openTrade.entry) / openTrade.entry 
+          : (openTrade.entry - exitPrice) / openTrade.entry;
+        const pnl = openTrade.size * pricePct;
+        capital += pnl;
+        trades.push({ ...openTrade, exitPrice, pnl, reason, closeTime: current.time });
+        openTrade = null;
+        if (capital > peakCapital) peakCapital = capital;
+        const dd = (peakCapital - capital) / peakCapital;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+      }
+      continue;
+    }
+    
+    const a = analyze(closes, highs, lows);
+    if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
+      const size = capital * riskPct;
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence };
+    }
+  }
+  
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const winRate = trades.length > 0 ? (wins / trades.length * 100) : 0;
+  const totalPnl = capital - initialCapital;
+  const totalReturn = (totalPnl / initialCapital) * 100;
+  
+  return {
+    trades: trades.length, wins, losses,
+    winRate: winRate.toFixed(1),
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalReturn: totalReturn.toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2)
+  };
+}
+
+app.post("/backtest", async (req, res) => {
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000 } = req.body;
+  try {
+    const candles = await fetchHistoricalCandles(pair, tf, days);
+    if (candles.length < 250) {
+      return res.status(400).json({ error: 'No hay suficientes datos históricos para este período' });
+    }
+    const result = runBacktestEngine(candles, { minConfidence, riskPct, initialCapital });
+    res.json({
+      success: true,
+      config: { pair, tf, days, minConfidence, riskPct, initialCapital },
+      dataRange: { from: new Date(candles[0].time).toISOString(), to: new Date(candles[candles.length-1].time).toISOString(), totalCandles: candles.length },
+      result
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Backend v2 corriendo en puerto ${PORT} - AUTO 24/7 habilitado`);
   scheduleDailySummary();

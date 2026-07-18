@@ -151,7 +151,7 @@ function analyze(closes, highs, lows) {
 }
 
 async function fetchKlines(pair, tf, limit = 100) {
-  const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}`);
+  const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}`);
   if (!res.ok) throw new Error('Par no encontrado');
   const data = await res.json();
   return {
@@ -406,7 +406,7 @@ async function fetchHistoricalCandles(pair, tf, days) {
   let endTime = Date.now();
   
   while (allCandles.length < totalCandles) {
-    const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}&endTime=${endTime}`);
+    const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}&endTime=${endTime}`);
     if (!res.ok) throw new Error('Binance fetch failed: ' + res.status);
     const data = await res.json();
     if (data.length === 0) break;

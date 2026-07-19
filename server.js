@@ -4,8 +4,7 @@ process.on('unhandledRejection', (e) => { console.error('UNHANDLED:', e); });
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(cors());
@@ -15,40 +14,66 @@ const PORT = process.env.PORT || 3001;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "signalbot2024";
-const DATA_FILE = path.join(__dirname, "bot_state.json");
+const MONGODB_URI = process.env.MONGODB_URI;
 
-// ── State management (file-based, simple persistence) ────
-function loadState() {
+const DEFAULT_STATE = {
+  capital: 1000,
+  trades: [],
+  dailyPnl: 0,
+  dailyTrades: 0,
+  openTrade: null,
+  autoMode: false,
+  autoPairs: ["BTCUSDT", "ETHUSDT"], // Validated by backtest: positive results in 180 days
+  autoTFs: ["4h"], // Validated by backtest: 4h gives best results vs 15m/1h
+  minConfidence: 70,
+  requireMTF: false, // Only one TF now (4h), so multi-TF confirmation not needed
+  maxDailyGainPct: 5,
+  maxDailyLossPct: 3,
+  consecutiveLosses: 0,
+  lastResetDate: new Date().toDateString()
+};
+
+// ── State management (MongoDB - truly persistent) ─────────
+let mongoClient = null;
+let stateCollection = null;
+let state = { ...DEFAULT_STATE };
+
+async function initMongo() {
+  if (!MONGODB_URI) {
+    console.log("MONGODB_URI no configurado - usando estado solo en memoria (se pierde al reiniciar)");
+    return;
+  }
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000, connectTimeoutMS: 8000 });
+    await mongoClient.connect();
+    const db = mongoClient.db("signalbot");
+    stateCollection = db.collection("bot_state");
+    console.log("MongoDB conectado correctamente");
+    const saved = await stateCollection.findOne({ _id: "main" });
+    if (saved) {
+      delete saved._id;
+      state = { ...DEFAULT_STATE, ...saved };
+      console.log("Estado cargado desde MongoDB - Capital:", state.capital);
+    } else {
+      await stateCollection.insertOne({ _id: "main", ...DEFAULT_STATE });
+      console.log("Estado inicial creado en MongoDB");
     }
-  } catch (e) { console.log("Load state error:", e.message); }
-  return {
-    capital: 1000,
-    trades: [],
-    dailyPnl: 0,
-    dailyTrades: 0,
-    openTrade: null,
-    autoMode: false,
-    autoPairs: ["BTCUSDT", "ETHUSDT"], // Validated by backtest: positive results in 180 days
-    autoTFs: ["4h"], // Validated by backtest: 4h gives best results vs 15m/1h
-    minConfidence: 70,
-    requireMTF: false, // Only one TF now (4h), so multi-TF confirmation not needed
-    maxDailyGainPct: 5,
-    maxDailyLossPct: 3,
-    consecutiveLosses: 0,
-    lastResetDate: new Date().toDateString()
-  };
+  } catch (e) {
+    console.log("Error conectando MongoDB:", e.message);
+  }
 }
 
-function saveState(state) {
+async function saveState(newState) {
+  state = newState;
+  if (!stateCollection) return;
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+    await stateCollection.updateOne(
+      { _id: "main" },
+      { $set: { ...state } },
+      { upsert: true }
+    );
   } catch (e) { console.log("Save state error:", e.message); }
 }
-
-let state = loadState();
 
 // ── HMAC ──────────────────────────────────────────────────
 function hmac(secret, message) {
@@ -245,7 +270,7 @@ async function fetchKlines(pair, tf, limit = 100) {
 }
 
 // ── Auto trading loop (runs server-side, 24/7) ────────────
-function openTrade(pair, tf, analysis) {
+async function openTrade(pair, tf, analysis) {
   const size = state.capital * 0.20;
   const qty = analysis.entry > 0 ? size / analysis.entry : 0;
   state.openTrade = {
@@ -254,12 +279,12 @@ function openTrade(pair, tf, analysis) {
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     confidence: analysis.confidence, auto: true
   };
-  saveState(state);
+  await saveState(state);
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
   sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%`);
 }
 
-function closeTrade(exitPrice, reason) {
+async function closeTrade(exitPrice, reason) {
   if (!state.openTrade) return;
   const t = state.openTrade;
   const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
@@ -275,13 +300,13 @@ function closeTrade(exitPrice, reason) {
   state.dailyTrades += 1;
   if (pnl < 0) state.consecutiveLosses += 1; else state.consecutiveLosses = 0;
   state.openTrade = null;
-  saveState(state);
+  await saveState(state);
   const emoji = pnl >= 0 ? '✅' : '❌';
   sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${t.entry.toFixed(2)} → $${exitPrice.toFixed(2)}\n${pnl>=0?'💰':'📉'} PnL: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n🏷 ${reason}\n💰 Capital: $${state.capital.toFixed(2)}`);
   if (state.consecutiveLosses >= 3) {
     sendTelegram(`⚠️ BOT PAUSADO (Servidor)\n3 pérdidas seguidas\n🛡 Capital protegido: $${state.capital.toFixed(2)}`);
     state.autoMode = false;
-    saveState(state);
+    await saveState(state);
   }
 }
 
@@ -290,17 +315,17 @@ async function runAutoCheck() {
   const today = new Date().toDateString();
   if (state.lastResetDate !== today) {
     state.dailyPnl = 0; state.dailyTrades = 0; state.lastResetDate = today;
-    saveState(state);
+    await saveState(state);
   }
   const maxGain = state.capital * state.maxDailyGainPct / 100;
   const maxLoss = state.capital * state.maxDailyLossPct / 100;
   if (state.dailyPnl >= maxGain) {
     sendTelegram(`✅ Límite de ganancia diaria alcanzado ($${state.dailyPnl.toFixed(2)})`);
-    state.autoMode = false; saveState(state); return;
+    state.autoMode = false; await saveState(state); return;
   }
   if (state.dailyPnl <= -maxLoss) {
     sendTelegram(`🛑 Límite de pérdida diaria alcanzado ($${state.dailyPnl.toFixed(2)})`);
-    state.autoMode = false; saveState(state); return;
+    state.autoMode = false; await saveState(state); return;
   }
 
   // Check if open trade should close
@@ -309,10 +334,10 @@ async function runAutoCheck() {
       const { closes } = await fetchKlines(state.openTrade.pair, "1m", 2);
       const currentPrice = closes[closes.length - 1];
       const t = state.openTrade;
-      if (t.signal === 'COMPRAR' && currentPrice >= t.tp) closeTrade(currentPrice, 'TP Auto');
-      else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) closeTrade(currentPrice, 'SL Auto');
-      else if (t.signal === 'VENDER' && currentPrice <= t.tp) closeTrade(currentPrice, 'TP Auto');
-      else if (t.signal === 'VENDER' && currentPrice >= t.sl) closeTrade(currentPrice, 'SL Auto');
+      if (t.signal === 'COMPRAR' && currentPrice >= t.tp) await closeTrade(currentPrice, 'TP Auto');
+      else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) await closeTrade(currentPrice, 'SL Auto');
+      else if (t.signal === 'VENDER' && currentPrice <= t.tp) await closeTrade(currentPrice, 'TP Auto');
+      else if (t.signal === 'VENDER' && currentPrice >= t.sl) await closeTrade(currentPrice, 'SL Auto');
     } catch (e) { console.log('Check open trade error:', e.message); }
     return;
   }
@@ -343,7 +368,7 @@ async function runAutoCheck() {
 
   if (allSignals.length > 0) {
     const best = allSignals.sort((a, b) => b.score - a.score)[0];
-    openTrade(best.pair, best.tf, best.analysis);
+    await openTrade(best.pair, best.tf, best.analysis);
   }
 }
 
@@ -356,7 +381,7 @@ app.get("/state", (req, res) => {
   res.json(state);
 });
 
-app.post("/state/config", (req, res) => {
+app.post("/state/config", async (req, res) => {
   const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct } = req.body;
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
@@ -364,26 +389,26 @@ app.post("/state/config", (req, res) => {
   if (requireMTF !== undefined) state.requireMTF = requireMTF;
   if (maxDailyGainPct !== undefined) state.maxDailyGainPct = maxDailyGainPct;
   if (maxDailyLossPct !== undefined) state.maxDailyLossPct = maxDailyLossPct;
-  saveState(state);
+  await saveState(state);
   res.json({ success: true, state });
 });
 
-app.post("/state/toggle-auto", (req, res) => {
+app.post("/state/toggle-auto", async (req, res) => {
   state.autoMode = !state.autoMode;
-  saveState(state);
+  await saveState(state);
   sendTelegram(state.autoMode ? '▶ Bot automático activado (Servidor 24/7)' : '■ Bot automático detenido (Servidor)');
   if (state.autoMode) runAutoCheck();
   res.json({ success: true, autoMode: state.autoMode });
 });
 
-app.post("/state/reset", (req, res) => {
+app.post("/state/reset", async (req, res) => {
   state = {
     capital: 1000, trades: [], dailyPnl: 0, dailyTrades: 0, openTrade: null,
     autoMode: false, autoPairs: ["BTCUSDT"], autoTFs: ["15m", "1h"],
     minConfidence: 70, requireMTF: true, maxDailyGainPct: 5, maxDailyLossPct: 3,
     consecutiveLosses: 0, lastResetDate: new Date().toDateString()
   };
-  saveState(state);
+  await saveState(state);
   res.json({ success: true, state });
 });
 
@@ -465,7 +490,7 @@ function scheduleDailySummary() {
   }, ms);
 }
 
-function sendDailySummaryMsg() {
+async function sendDailySummaryMsg() {
   const wins = state.trades.filter(t => t.pnl > 0).length;
   const losses = state.trades.filter(t => t.pnl < 0).length;
   const winRate = state.trades.length > 0 ? Math.round(wins / state.trades.length * 100) : 0;
@@ -478,7 +503,7 @@ function sendDailySummaryMsg() {
   const now = new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'});
   sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L hoy: ${state.dailyPnl>=0?'+':''}$${state.dailyPnl.toFixed(2)}\n🎯 Operaciones hoy: ${state.dailyTrades}\n✅ Ganadas: ${wins}\n❌ Perdidas: ${losses}\n📊 Win Rate: ${winRate}%\n\n${motivacion}`);
   state.dailyPnl = 0; state.dailyTrades = 0;
-  saveState(state);
+  await saveState(state);
 }
 
 // ── Backtest Engine ───────────────────────────────────────
@@ -589,10 +614,11 @@ app.post("/backtest", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Backend v2 corriendo en puerto ${PORT} - AUTO 24/7 habilitado`);
+  await initMongo();
   scheduleDailySummary();
-  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'})}\n🤖 Modo AUTO ahora corre en el servidor 24/7`);
+  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'})}\n💾 Persistencia: ${stateCollection ? 'MongoDB conectado ✅' : 'Solo memoria ⚠️'}\n🤖 Modo AUTO: ${state.autoMode ? 'Activo' : 'Inactivo'}`);
   // Start the auto-check loop (runs every 60 seconds regardless of browser)
   setInterval(runAutoCheck, 60000);
 });

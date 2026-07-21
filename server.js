@@ -141,6 +141,34 @@ function calcATR(h, l, c, p = 14) {
   return atr / p;
 }
 
+// Nube de Ichimoku: calcula dónde está el techo/piso de la nube que corresponde
+// al precio ACTUAL (los Senkou Spans se proyectan 26 velas hacia adelante cuando
+// se dibujan, así que la nube "de hoy" se calculó con datos de hace 26 velas).
+function calcIchimokuCloud(highs, lows, closes) {
+  const p1 = 9, p2 = 26, p3 = 52, disp = 26;
+  const n = closes.length;
+  if (n < p3 + disp + 1) return null;
+  const donchian = (period, idx) => {
+    const h = highs.slice(idx - period + 1, idx + 1);
+    const l = lows.slice(idx - period + 1, idx + 1);
+    return (Math.max(...h) + Math.min(...l)) / 2;
+  };
+  const lastIdx = n - 1;
+  const cloudIdx = lastIdx - disp; // vela desde la que se proyectó la nube que cae sobre el precio de hoy
+  if (cloudIdx - p3 + 1 < 0) return null;
+  const senkouA = (donchian(p1, cloudIdx) + donchian(p2, cloudIdx)) / 2;
+  const senkouB = donchian(p3, cloudIdx);
+  const cloudTop = Math.max(senkouA, senkouB);
+  const cloudBottom = Math.min(senkouA, senkouB);
+  const price = closes[lastIdx];
+  return {
+    cloudTop, cloudBottom, price,
+    aboveCloud: price > cloudTop,
+    belowCloud: price < cloudBottom,
+    insideCloud: price >= cloudBottom && price <= cloudTop
+  };
+}
+
 function calcRSISeries(c, p = 14) {
   const rsiValues = [];
   for (let i = p; i < c.length; i++) {
@@ -215,13 +243,18 @@ function analyzeImproved(closes, highs, lows) {
   let signal = 'NEUTRO', direction = 'ESPERAR';
   if (diff >= 4 && isVolatileEnough && !trendDown) { signal = 'COMPRAR'; direction = 'LARGO'; }
   else if (diff <= -4 && isVolatileEnough && !trendUp) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // resistencia de la nube sin romper
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // soporte de la nube sin romper
+  }
   let entry = price, tp, sl;
   const slMultiplier = 1.5, tpMultiplier = 3.0;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr, cloud };
 }
 
 // Segunda vía de señal: sigue tendencias suaves y sostenidas que la estrategia
@@ -250,13 +283,18 @@ function analyzeTrendFollow(closes, highs, lows) {
   let signal = 'NEUTRO', direction = 'ESPERAR';
   if (diff >= 4 && isVolatileEnough) { signal = 'COMPRAR'; direction = 'LARGO'; }
   else if (diff <= -4 && isVolatileEnough) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // resistencia de la nube sin romper
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // soporte de la nube sin romper
+  }
   let entry = price, tp, sl;
   const slMultiplier = 1.5, tpMultiplier = 3.0;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud };
 }
 
 function analyze(closes, highs, lows) {
@@ -324,7 +362,8 @@ async function openTrade(pair, tf, analysis) {
   state.openTrades.push(trade);
   await saveState(state);
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 async function closeTradeById(tradeId, exitPrice, reason) {

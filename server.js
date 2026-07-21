@@ -21,7 +21,7 @@ const DEFAULT_STATE = {
   trades: [],
   dailyPnl: 0,
   dailyTrades: 0,
-  openTrade: null,
+  openTrades: [], // Multi-posición: una operación abierta por par como máximo
   autoMode: false,
   autoPairs: ["BTCUSDT", "ETHUSDT"], // Validated by backtest: positive results in 180 days
   autoTFs: ["4h"], // Validated by backtest: 4h gives best results vs 15m/1h
@@ -29,6 +29,7 @@ const DEFAULT_STATE = {
   requireMTF: false, // Only one TF now (4h), so multi-TF confirmation not needed
   maxDailyGainPct: 5,
   maxDailyLossPct: 3,
+  positionSizePct: 20, // % del capital por operación individual (probando 10/15/20)
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -271,23 +272,26 @@ async function fetchKlines(pair, tf, limit = 100) {
 
 // ── Auto trading loop (runs server-side, 24/7) ────────────
 async function openTrade(pair, tf, analysis) {
-  const size = state.capital * 0.20;
+  const pct = state.positionSizePct || 20;
+  const size = state.capital * (pct / 100);
   const qty = analysis.entry > 0 ? size / analysis.entry : 0;
-  state.openTrade = {
-    id: Date.now(), pair, signal: analysis.signal, direction: analysis.direction,
+  const trade = {
+    id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
   };
+  state.openTrades.push(trade);
   await saveState(state);
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%`);
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
-async function closeTrade(exitPrice, reason) {
-  if (!state.openTrade) return;
-  const t = state.openTrade;
+async function closeTradeById(tradeId, exitPrice, reason) {
+  const idx = state.openTrades.findIndex(t => t.id === tradeId);
+  if (idx === -1) return;
+  const t = state.openTrades[idx];
   const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
   const rawPnl = t.size * pricePct;
   const pnl = Math.max(-t.size, Math.min(rawPnl, t.size * 5));
@@ -300,7 +304,7 @@ async function closeTrade(exitPrice, reason) {
   state.dailyPnl += pnl;
   state.dailyTrades += 1;
   if (pnl < 0) state.consecutiveLosses += 1; else state.consecutiveLosses = 0;
-  state.openTrade = null;
+  state.openTrades.splice(idx, 1);
   await saveState(state);
   const emoji = pnl >= 0 ? '✅' : '❌';
   sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${t.entry.toFixed(2)} → $${exitPrice.toFixed(2)}\n${pnl>=0?'💰':'📉'} PnL: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n🏷 ${reason}\n💰 Capital: $${state.capital.toFixed(2)}`);
@@ -329,34 +333,36 @@ async function runAutoCheck() {
     state.autoMode = false; await saveState(state); return;
   }
 
-  // Check if open trade should close
-  if (state.openTrade) {
+  // Check each open trade individually (multi-posición: una por par)
+  for (const t of [...state.openTrades]) {
     try {
-      const { closes } = await fetchKlines(state.openTrade.pair, "1m", 2);
+      const { closes } = await fetchKlines(t.pair, "1m", 2);
       const currentPrice = closes[closes.length - 1];
-      const t = state.openTrade;
-      
+
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
       const MAX_HOURS_OPEN = 48;
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
-      
-      if (t.signal === 'COMPRAR' && currentPrice >= t.tp) await closeTrade(currentPrice, 'TP Auto');
-      else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) await closeTrade(currentPrice, 'SL Auto');
-      else if (t.signal === 'VENDER' && currentPrice <= t.tp) await closeTrade(currentPrice, 'TP Auto');
-      else if (t.signal === 'VENDER' && currentPrice >= t.sl) await closeTrade(currentPrice, 'SL Auto');
+
+      if (t.signal === 'COMPRAR' && currentPrice >= t.tp) await closeTradeById(t.id, currentPrice, 'TP Auto');
+      else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) await closeTradeById(t.id, currentPrice, 'SL Auto');
+      else if (t.signal === 'VENDER' && currentPrice <= t.tp) await closeTradeById(t.id, currentPrice, 'TP Auto');
+      else if (t.signal === 'VENDER' && currentPrice >= t.sl) await closeTradeById(t.id, currentPrice, 'SL Auto');
       else if (hoursOpen >= MAX_HOURS_OPEN) {
-        await closeTrade(currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
+        await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
         sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba más de ${MAX_HOURS_OPEN}hs abierta sin tocar TP/SL\nSe cerró al precio de mercado para liberar el capital.`);
       }
     } catch (e) { console.log('Check open trade error:', e.message); }
-    return;
   }
 
-  // Look for new signal across pairs and timeframes
+  // Look for new signal only on pairs that don't already have an open trade
+  const openPairs = new Set(state.openTrades.map(t => t.pair));
+  const freePairs = state.autoPairs.filter(p => !openPairs.has(p));
+  if (freePairs.length === 0) return;
+
   let allSignals = [];
-  for (const pair of state.autoPairs) {
+  for (const pair of freePairs) {
     let signals = [];
     for (const tf of state.autoTFs) {
       try {
@@ -378,8 +384,9 @@ async function runAutoCheck() {
     }
   }
 
-  if (allSignals.length > 0) {
-    const best = allSignals.sort((a, b) => b.score - a.score)[0];
+  // Open a trade for EVERY free pair with a valid signal (not just the single best) —
+  // this is what actually increases daily trade frequency vs. the old one-at-a-time logic
+  for (const best of allSignals) {
     await openTrade(best.pair, best.tf, best.analysis);
   }
 }
@@ -394,13 +401,14 @@ app.get("/state", (req, res) => {
 });
 
 app.post("/state/config", async (req, res) => {
-  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct } = req.body;
+  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct } = req.body;
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
   if (minConfidence !== undefined) state.minConfidence = minConfidence;
   if (requireMTF !== undefined) state.requireMTF = requireMTF;
   if (maxDailyGainPct !== undefined) state.maxDailyGainPct = maxDailyGainPct;
   if (maxDailyLossPct !== undefined) state.maxDailyLossPct = maxDailyLossPct;
+  if (positionSizePct !== undefined) state.positionSizePct = positionSizePct;
   await saveState(state);
   res.json({ success: true, state });
 });
@@ -414,12 +422,18 @@ app.post("/state/toggle-auto", async (req, res) => {
 });
 
 app.post("/state/close-trade", async (req, res) => {
-  if (!state.openTrade) return res.status(400).json({ error: "No hay operación abierta para cerrar" });
+  if (!state.openTrades || state.openTrades.length === 0) return res.status(400).json({ error: "No hay operaciones abiertas para cerrar" });
+  const { pair, id } = req.body || {};
+  let target;
+  if (id) target = state.openTrades.find(t => t.id === id);
+  else if (pair) target = state.openTrades.find(t => t.pair === pair);
+  else if (state.openTrades.length === 1) target = state.openTrades[0];
+  else return res.status(400).json({ error: "Hay varias operaciones abiertas, especificá 'pair' o 'id' para elegir cuál cerrar", openTrades: state.openTrades });
+  if (!target) return res.status(404).json({ error: "No se encontró esa operación abierta" });
   try {
-    const t = state.openTrade;
-    const { closes } = await fetchKlines(t.pair, "1m", 2);
+    const { closes } = await fetchKlines(target.pair, "1m", 2);
     const currentPrice = closes[closes.length - 1];
-    await closeTrade(currentPrice, "Cierre Manual");
+    await closeTradeById(target.id, currentPrice, "Cierre Manual");
     res.json({ success: true, state });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -427,7 +441,7 @@ app.post("/state/close-trade", async (req, res) => {
 });
 
 app.post("/state/reset", async (req, res) => {
-  state = { ...DEFAULT_STATE, trades: [], openTrade: null, dailyPnl: 0, dailyTrades: 0, consecutiveLosses: 0, lastResetDate: new Date().toDateString() };
+  state = { ...DEFAULT_STATE, trades: [], openTrades: [], dailyPnl: 0, dailyTrades: 0, consecutiveLosses: 0, lastResetDate: new Date().toDateString() };
   await saveState(state);
   res.json({ success: true, state });
 });

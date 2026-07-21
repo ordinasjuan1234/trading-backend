@@ -277,6 +277,7 @@ async function openTrade(pair, tf, analysis) {
     id: Date.now(), pair, signal: analysis.signal, direction: analysis.direction,
     entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
+    openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
   };
   await saveState(state);
@@ -334,10 +335,21 @@ async function runAutoCheck() {
       const { closes } = await fetchKlines(state.openTrade.pair, "1m", 2);
       const currentPrice = closes[closes.length - 1];
       const t = state.openTrade;
+      
+      // Time-based safety close: if a trade has been open too long without hitting TP/SL,
+      // close it at market price to avoid capital being stuck indefinitely
+      const MAX_HOURS_OPEN = 48;
+      const openTimestamp = t.openTimestamp || Date.now();
+      const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
+      
       if (t.signal === 'COMPRAR' && currentPrice >= t.tp) await closeTrade(currentPrice, 'TP Auto');
       else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) await closeTrade(currentPrice, 'SL Auto');
       else if (t.signal === 'VENDER' && currentPrice <= t.tp) await closeTrade(currentPrice, 'TP Auto');
       else if (t.signal === 'VENDER' && currentPrice >= t.sl) await closeTrade(currentPrice, 'SL Auto');
+      else if (hoursOpen >= MAX_HOURS_OPEN) {
+        await closeTrade(currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
+        sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba más de ${MAX_HOURS_OPEN}hs abierta sin tocar TP/SL\nSe cerró al precio de mercado para liberar el capital.`);
+      }
     } catch (e) { console.log('Check open trade error:', e.message); }
     return;
   }

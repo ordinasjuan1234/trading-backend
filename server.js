@@ -413,13 +413,21 @@ app.post("/state/toggle-auto", async (req, res) => {
   res.json({ success: true, autoMode: state.autoMode });
 });
 
+app.post("/state/close-trade", async (req, res) => {
+  if (!state.openTrade) return res.status(400).json({ error: "No hay operación abierta para cerrar" });
+  try {
+    const t = state.openTrade;
+    const { closes } = await fetchKlines(t.pair, "1m", 2);
+    const currentPrice = closes[closes.length - 1];
+    await closeTrade(currentPrice, "Cierre Manual");
+    res.json({ success: true, state });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/state/reset", async (req, res) => {
-  state = {
-    capital: 1000, trades: [], dailyPnl: 0, dailyTrades: 0, openTrade: null,
-    autoMode: false, autoPairs: ["BTCUSDT"], autoTFs: ["15m", "1h"],
-    minConfidence: 70, requireMTF: true, maxDailyGainPct: 5, maxDailyLossPct: 3,
-    consecutiveLosses: 0, lastResetDate: new Date().toDateString()
-  };
+  state = { ...DEFAULT_STATE, trades: [], openTrade: null, dailyPnl: 0, dailyTrades: 0, consecutiveLosses: 0, lastResetDate: new Date().toDateString() };
   await saveState(state);
   res.json({ success: true, state });
 });

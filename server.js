@@ -221,7 +221,7 @@ function analyzeImproved(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión' };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr };
 }
 
 // Segunda vía de señal: sigue tendencias suaves y sostenidas que la estrategia
@@ -256,7 +256,7 @@ function analyzeTrendFollow(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia' };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr };
 }
 
 function analyze(closes, highs, lows) {
@@ -314,6 +314,9 @@ async function openTrade(pair, tf, analysis) {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     strategy: analysis.strategy || 'Reversión',
+    atr: analysis.atr || Math.abs(analysis.entry - analysis.sl) / 1.5,
+    peakPrice: analysis.entry,
+    trailingActive: false,
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
@@ -374,6 +377,37 @@ async function runAutoCheck() {
     try {
       const { closes } = await fetchKlines(t.pair, "1m", 2);
       const currentPrice = closes[closes.length - 1];
+
+      // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
+      // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.
+      const atr = t.atr || Math.abs(t.entry - t.sl) / 1.5;
+      const ACTIVATION_ATR = 1.0;  // se activa cuando la ganancia flotante llega a 1x ATR
+      const TRAIL_DISTANCE_ATR = 1.0; // el SL persigue el precio a 1x ATR de distancia del mejor precio alcanzado
+      if (t.signal === 'COMPRAR') {
+        if (currentPrice > t.peakPrice) t.peakPrice = currentPrice;
+        const favorableMove = t.peakPrice - t.entry;
+        if (favorableMove >= atr * ACTIVATION_ATR) {
+          const candidateSl = Math.max(t.entry, t.peakPrice - atr * TRAIL_DISTANCE_ATR);
+          if (candidateSl > t.sl) {
+            const wasActive = t.trailingActive;
+            t.sl = candidateSl; t.trailingActive = true;
+            await saveState(state);
+            if (!wasActive) sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+          }
+        }
+      } else if (t.signal === 'VENDER') {
+        if (currentPrice < t.peakPrice) t.peakPrice = currentPrice;
+        const favorableMove = t.entry - t.peakPrice;
+        if (favorableMove >= atr * ACTIVATION_ATR) {
+          const candidateSl = Math.min(t.entry, t.peakPrice + atr * TRAIL_DISTANCE_ATR);
+          if (candidateSl < t.sl) {
+            const wasActive = t.trailingActive;
+            t.sl = candidateSl; t.trailingActive = true;
+            await saveState(state);
+            if (!wasActive) sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+          }
+        }
+      }
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely

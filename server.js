@@ -131,6 +131,22 @@ function calcMACD(c) {
   if (!e12 || !e26) return null;
   return { macdLine: e12 - e26 };
 }
+// Compara la volatilidad reciente (últimas 5 velas) contra la volatilidad
+// "normal" del par (últimas 50 velas) para calibrar qué tan lejos pedir el
+// TP/SL. Un día con fuerza (rompiendo noticias, momentum) agranda el objetivo;
+// un día plano lo achica, en vez de pedir siempre el mismo % fijo.
+function calcVolatilityRegime(highs, lows, closes) {
+  const shortATR = calcATR(highs, lows, closes, 5);
+  const baseATR = calcATR(highs, lows, closes, 50);
+  if (!shortATR || !baseATR || baseATR === 0) return { regime: 'normal', ratio: 1, multiplierScale: 1 };
+  const ratio = shortATR / baseATR;
+  let regime, multiplierScale;
+  if (ratio >= 1.3) { regime = 'Alta (día con fuerza)'; multiplierScale = 1.4; }
+  else if (ratio <= 0.7) { regime = 'Baja (día plano)'; multiplierScale = 0.7; }
+  else { regime = 'Normal'; multiplierScale = 1.0; }
+  return { regime, ratio, multiplierScale };
+}
+
 function calcATR(h, l, c, p = 14) {
   if (h.length < p + 1) return null;
   let atr = 0;
@@ -249,12 +265,13 @@ function analyzeImproved(closes, highs, lows) {
     if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // soporte de la nube sin romper
   }
   let entry = price, tp, sl;
-  const slMultiplier = 1.5, tpMultiplier = 3.0;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const slMultiplier = 1.5 * vol.multiplierScale, tpMultiplier = 3.0 * vol.multiplierScale;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr, cloud };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr, cloud, volRegime: vol.regime };
 }
 
 // Segunda vía de señal: sigue tendencias suaves y sostenidas que la estrategia
@@ -289,12 +306,13 @@ function analyzeTrendFollow(closes, highs, lows) {
     if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // soporte de la nube sin romper
   }
   let entry = price, tp, sl;
-  const slMultiplier = 1.5, tpMultiplier = 3.0;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const slMultiplier = 1.5 * vol.multiplierScale, tpMultiplier = 3.0 * vol.multiplierScale;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime };
 }
 
 function analyze(closes, highs, lows) {
@@ -363,7 +381,8 @@ async function openTrade(pair, tf, analysis) {
   await saveState(state);
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
   const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 async function closeTradeById(tradeId, exitPrice, reason) {

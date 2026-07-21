@@ -221,7 +221,42 @@ function analyzeImproved(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión' };
+}
+
+// Segunda vía de señal: sigue tendencias suaves y sostenidas que la estrategia
+// de reversión (arriba) ignora porque exige RSI en zona de sobrecompra/sobreventa.
+// Esta detecta subas/bajas parejas donde precio y EMAs están alineadas y en movimiento.
+function analyzeTrendFollow(closes, highs, lows) {
+  if (!closes || closes.length < 60) return null;
+  const price = closes[closes.length - 1];
+  const ema20Now = calcEMA(closes, 20);
+  const ema20Before = calcEMA(closes.slice(0, -5), 20);
+  const ema50Now = calcEMA(closes, 50);
+  const ema50Before = calcEMA(closes.slice(0, -5), 50);
+  if (!ema20Now || !ema50Now || !ema20Before || !ema50Before) return null;
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (price > ema20Now) bull += 1; else bear += 1;
+  if (price > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema50Now) bull += 1; else bear += 1; // alineación alcista/bajista de EMAs
+  if (ema20Now > ema20Before) bull += 2; else if (ema20Now < ema20Before) bear += 2; // EMA20 en movimiento
+  if (ema50Now > ema50Before) bull += 1; else if (ema50Now < ema50Before) bear += 1; // EMA50 en movimiento
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  if (diff >= 4 && isVolatileEnough) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough) { signal = 'VENDER'; direction = 'SHORT'; }
+  let entry = price, tp, sl;
+  const slMultiplier = 1.5, tpMultiplier = 3.0;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia' };
 }
 
 function analyze(closes, highs, lows) {
@@ -278,6 +313,7 @@ async function openTrade(pair, tf, analysis) {
   const trade = {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
+    strategy: analysis.strategy || 'Reversión',
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
@@ -285,7 +321,7 @@ async function openTrade(pair, tf, analysis) {
   state.openTrades.push(trade);
   await saveState(state);
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 async function closeTradeById(tradeId, exitPrice, reason) {
@@ -370,6 +406,8 @@ async function runAutoCheck() {
         const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
         const a = analyzeImproved(closes, highs, lows);
         if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
+        const b = analyzeTrendFollow(closes, highs, lows);
+        if (b) signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
     const buys = signals.filter(s => s.signal === 'COMPRAR' && s.confidence >= state.minConfidence);

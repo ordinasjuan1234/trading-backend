@@ -30,6 +30,7 @@ const DEFAULT_STATE = {
   maxDailyGainPct: 5,
   maxDailyLossPct: 3,
   positionSizePct: 20, // % del capital por operación individual (probando 10/15/20)
+  subSlThresholdMin: 5, // minutos de desacuerdo sostenido en 15m antes de cortar (probando 5/15/30)
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -548,7 +549,7 @@ async function runAutoCheck() {
           } else {
             t.trendDisagreeCount = 0;
           }
-          const DISAGREE_THRESHOLD = 5; // ~5 chequeos seguidos (aprox. 5 minutos) de desacuerdo sostenido
+          const DISAGREE_THRESHOLD = state.subSlThresholdMin || 5; // minutos de desacuerdo sostenido (chequeo cada 60s ≈ 1 por minuto)
           if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {
             sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.`);
             await closeTradeById(t.id, currentPrice, 'Sub-SL: tendencia 15m en contra');
@@ -633,7 +634,7 @@ app.get("/state", (req, res) => {
 });
 
 app.post("/state/config", async (req, res) => {
-  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct } = req.body;
+  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin } = req.body;
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
   if (minConfidence !== undefined) state.minConfidence = minConfidence;
@@ -641,6 +642,7 @@ app.post("/state/config", async (req, res) => {
   if (maxDailyGainPct !== undefined) state.maxDailyGainPct = maxDailyGainPct;
   if (maxDailyLossPct !== undefined) state.maxDailyLossPct = maxDailyLossPct;
   if (positionSizePct !== undefined) state.positionSizePct = positionSizePct;
+  if (subSlThresholdMin !== undefined) state.subSlThresholdMin = subSlThresholdMin;
   await saveState(state);
   res.json({ success: true, state });
 });

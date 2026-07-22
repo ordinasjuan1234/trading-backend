@@ -559,13 +559,21 @@ async function runAutoCheck() {
     const buys = signals.filter(s => s.signal === 'COMPRAR' && s.confidence >= state.minConfidence);
     const sells = signals.filter(s => s.signal === 'VENDER' && s.confidence >= state.minConfidence);
     const threshold = state.requireMTF ? 2 : 1;
+    // Antes esto era if/else if, lo que hacía que COMPRAR siempre le ganara a VENDER
+    // por defecto cuando había señales de ambos lados al mismo tiempo (con 2 estrategias
+    // x 2 timeframes, esto pasaba seguido). Ahora se evalúan las dos y gana la que
+    // tenga más fuerza real (más señales coincidiendo × confianza), sin sesgo direccional.
+    let chosen = null;
     if (buys.length >= threshold) {
       const best = buys.sort((a, b) => b.confidence - a.confidence)[0];
-      allSignals.push({ ...best, direction: 'COMPRAR', score: buys.length * best.confidence });
-    } else if (sells.length >= threshold) {
-      const best = sells.sort((a, b) => b.confidence - a.confidence)[0];
-      allSignals.push({ ...best, direction: 'VENDER', score: sells.length * best.confidence });
+      chosen = { ...best, direction: 'COMPRAR', score: buys.length * best.confidence };
     }
+    if (sells.length >= threshold) {
+      const best = sells.sort((a, b) => b.confidence - a.confidence)[0];
+      const sellCandidate = { ...best, direction: 'VENDER', score: sells.length * best.confidence };
+      if (!chosen || sellCandidate.score > chosen.score) chosen = sellCandidate;
+    }
+    if (chosen) allSignals.push(chosen);
   }
 
   // Open a trade for EVERY free pair with a valid signal (not just the single best) —

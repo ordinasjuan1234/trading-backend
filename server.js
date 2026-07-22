@@ -373,6 +373,7 @@ async function openTrade(pair, tf, analysis) {
     atr: analysis.atr || Math.abs(analysis.entry - analysis.sl) / 1.5,
     peakPrice: analysis.entry,
     trailingActive: false,
+    partialTaken: false,
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
@@ -383,6 +384,38 @@ async function openTrade(pair, tf, analysis) {
   const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
   const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
   sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+}
+
+// Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,
+// y deja el resto corriendo (con el trailing stop protegiéndolo). Se dispara una
+// sola vez por operación, en el mismo momento en que se activa el trailing.
+async function partialCloseTrade(t, exitPrice) {
+  const halfSize = t.size / 2;
+  const halfQty = t.qty / 2;
+  const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
+  const rawPnl = halfSize * pricePct;
+  const pnlBeforeFees = Math.max(-halfSize, Math.min(rawPnl, halfSize * 5));
+  const COMMISSION_PCT = 0.001;
+  const commission = halfSize * COMMISSION_PCT * 2;
+  const pnl = pnlBeforeFees - commission;
+  const pnlPct = (pnl / halfSize) * 100;
+  const closedPortion = {
+    ...t, size: halfSize, qty: halfQty, exitPrice, pnl, pnlPct, pnlBeforeFees, commission,
+    closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
+    reason: 'TP Parcial (50%)'
+  };
+  state.trades.unshift(closedPortion);
+  if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
+  state.capital += pnl;
+  state.dailyPnl += pnl;
+  state.dailyTrades += 1;
+  // Reducimos la posición que queda abierta a la mitad restante
+  t.size = halfSize;
+  t.qty = halfQty;
+  t.partialTaken = true;
+  await saveState(state);
+  const emoji = pnl >= 0 ? '💰' : '📉';
+  sendTelegram(`${emoji} GANANCIA PARCIAL ASEGURADA (50%)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nPnL parcial: ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nQueda abierto el otro 50%, protegido con trailing stop.`);
 }
 
 async function closeTradeById(tradeId, exitPrice, reason) {
@@ -459,7 +492,10 @@ async function runAutoCheck() {
             const wasActive = t.trailingActive;
             t.sl = candidateSl; t.trailingActive = true;
             await saveState(state);
-            if (!wasActive) sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+            if (!wasActive) {
+              sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+              if (!t.partialTaken) await partialCloseTrade(t, currentPrice);
+            }
           }
         }
       } else if (t.signal === 'VENDER') {
@@ -471,7 +507,10 @@ async function runAutoCheck() {
             const wasActive = t.trailingActive;
             t.sl = candidateSl; t.trailingActive = true;
             await saveState(state);
-            if (!wasActive) sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+            if (!wasActive) {
+              sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
+              if (!t.partialTaken) await partialCloseTrade(t, currentPrice);
+            }
           }
         }
       }

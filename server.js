@@ -377,6 +377,7 @@ async function openTrade(pair, tf, analysis) {
     peakPrice: analysis.entry,
     trailingActive: false,
     partialTaken: false,
+    trendDisagreeCount: 0,
     openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
@@ -452,6 +453,20 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   }
 }
 
+// Mide la tendencia de las últimas 15 velas de 15m — se usa como "vigía" de corto
+// plazo para operaciones en timeframes más largos (1h/4h). Si contradice la
+// dirección de una operación abierta de forma sostenida, dispara un cierre
+// anticipado (sub-SL) sin esperar a que el precio recorra todo el SL original.
+function calcShortTermTrend(closes) {
+  if (!closes || closes.length < 16) return 'neutral';
+  const now = closes[closes.length - 1];
+  const then = closes[closes.length - 16]; // 15 velas atrás
+  const pctChange = (now - then) / then;
+  if (pctChange > 0.001) return 'alcista';
+  if (pctChange < -0.001) return 'bajista';
+  return 'neutral';
+}
+
 async function runAutoCheck() {
   if (!state.autoMode) return;
   const today = new Date().toDateString();
@@ -516,6 +531,31 @@ async function runAutoCheck() {
             }
           }
         }
+      }
+
+      // ── Sub-SL por tendencia de corto plazo (15m): solo aplica a operaciones
+      // en timeframes más largos (1h/4h). Si el corto plazo viene claramente en
+      // contra de forma SOSTENIDA (no un ruido de un momento) y la operación
+      // todavía no está en ganancia, se corta antes de llegar al SL completo.
+      if ((t.tf === '1h' || t.tf === '4h') && !t.trailingActive) {
+        try {
+          const { closes: closes15m } = await fetchKlines(t.pair, '15m', 20);
+          const shortTrend = calcShortTermTrend(closes15m);
+          const contradicts = (t.signal === 'COMPRAR' && shortTrend === 'bajista') || (t.signal === 'VENDER' && shortTrend === 'alcista');
+          const notYetProfitable = t.signal === 'COMPRAR' ? currentPrice <= t.entry : currentPrice >= t.entry;
+          if (contradicts && notYetProfitable) {
+            t.trendDisagreeCount = (t.trendDisagreeCount || 0) + 1;
+          } else {
+            t.trendDisagreeCount = 0;
+          }
+          const DISAGREE_THRESHOLD = 5; // ~5 chequeos seguidos (aprox. 5 minutos) de desacuerdo sostenido
+          if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {
+            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.`);
+            await closeTradeById(t.id, currentPrice, 'Sub-SL: tendencia 15m en contra');
+            continue;
+          }
+          await saveState(state);
+        } catch (e) { console.log('Short-term trend check error:', e.message); }
       }
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,

@@ -433,8 +433,13 @@ async function runAutoCheck() {
   // Check each open trade individually (multi-posición: una por par)
   for (const t of [...state.openTrades]) {
     try {
-      const { closes } = await fetchKlines(t.pair, "1m", 2);
+      // Traemos varias velas de 1m para cubrir el intervalo desde el último chequeo
+      // (60s) y usamos máximo/mínimo (mecha), no solo el cierre — así se detecta
+      // igual que lo haría una orden real de TP/SL puesta en el exchange.
+      const { closes, highs, lows } = await fetchKlines(t.pair, "1m", 3);
       const currentPrice = closes[closes.length - 1];
+      const recentHigh = Math.max(...highs);
+      const recentLow = Math.min(...lows);
 
       // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
       // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.
@@ -442,7 +447,7 @@ async function runAutoCheck() {
       const ACTIVATION_ATR = 1.0;  // se activa cuando la ganancia flotante llega a 1x ATR
       const TRAIL_DISTANCE_ATR = 1.0; // el SL persigue el precio a 1x ATR de distancia del mejor precio alcanzado
       if (t.signal === 'COMPRAR') {
-        if (currentPrice > t.peakPrice) t.peakPrice = currentPrice;
+        if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
         if (favorableMove >= atr * ACTIVATION_ATR) {
           const candidateSl = Math.max(t.entry, t.peakPrice - atr * TRAIL_DISTANCE_ATR);
@@ -454,7 +459,7 @@ async function runAutoCheck() {
           }
         }
       } else if (t.signal === 'VENDER') {
-        if (currentPrice < t.peakPrice) t.peakPrice = currentPrice;
+        if (recentLow < t.peakPrice) t.peakPrice = recentLow;
         const favorableMove = t.entry - t.peakPrice;
         if (favorableMove >= atr * ACTIVATION_ATR) {
           const candidateSl = Math.min(t.entry, t.peakPrice + atr * TRAIL_DISTANCE_ATR);
@@ -473,10 +478,13 @@ async function runAutoCheck() {
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
-      if (t.signal === 'COMPRAR' && currentPrice >= t.tp) await closeTradeById(t.id, currentPrice, 'TP Auto');
-      else if (t.signal === 'COMPRAR' && currentPrice <= t.sl) await closeTradeById(t.id, currentPrice, 'SL Auto');
-      else if (t.signal === 'VENDER' && currentPrice <= t.tp) await closeTradeById(t.id, currentPrice, 'TP Auto');
-      else if (t.signal === 'VENDER' && currentPrice >= t.sl) await closeTradeById(t.id, currentPrice, 'SL Auto');
+      // TP/SL ahora se detectan por mecha (high/low), pero el cierre se registra
+      // al precio EXACTO del TP/SL (así como llenaría una orden real), no al
+      // precio de cierre de la vela, que puede ser distinto.
+      if (t.signal === 'COMPRAR' && recentHigh >= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
+      else if (t.signal === 'COMPRAR' && recentLow <= t.sl) await closeTradeById(t.id, t.sl, 'SL Auto');
+      else if (t.signal === 'VENDER' && recentLow <= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
+      else if (t.signal === 'VENDER' && recentHigh >= t.sl) await closeTradeById(t.id, t.sl, 'SL Auto');
       else if (hoursOpen >= MAX_HOURS_OPEN) {
         await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
         sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba más de ${MAX_HOURS_OPEN}hs abierta sin tocar TP/SL\nSe cerró al precio de mercado para liberar el capital.`);

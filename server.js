@@ -391,9 +391,13 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const t = state.openTrades[idx];
   const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
   const rawPnl = t.size * pricePct;
-  const pnl = Math.max(-t.size, Math.min(rawPnl, t.size * 5));
-  const pnlPct = pricePct * 100;
-  const closed = { ...t, exitPrice, pnl, pnlPct, closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}), reason };
+  const pnlBeforeFees = Math.max(-t.size, Math.min(rawPnl, t.size * 5));
+  // Comisión simulada de Binance: 0.1% por lado (entrada + salida) sobre el tamaño de la posición
+  const COMMISSION_PCT = 0.001;
+  const commission = t.size * COMMISSION_PCT * 2;
+  const pnl = pnlBeforeFees - commission;
+  const pnlPct = (pnl / t.size) * 100;
+  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}), reason };
   state.trades.unshift(closed);
   if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
   state.capital += pnl;
@@ -404,7 +408,7 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   state.openTrades.splice(idx, 1);
   await saveState(state);
   const emoji = pnl >= 0 ? '✅' : '❌';
-  sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${t.entry.toFixed(2)} → $${exitPrice.toFixed(2)}\n${pnl>=0?'💰':'📉'} PnL: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n🏷 ${reason}\n💰 Capital: $${state.capital.toFixed(2)}`);
+  sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${t.entry.toFixed(2)} → $${exitPrice.toFixed(2)}\n${pnl>=0?'💰':'📉'} PnL neto: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n💸 Comisión simulada: -$${commission.toFixed(2)}\n🏷 ${reason}\n💰 Capital: $${state.capital.toFixed(2)}`);
   if (state.consecutiveLosses >= 3) {
     sendTelegram(`⚠️ BOT PAUSADO (Servidor)\n3 pérdidas seguidas\n🛡 Capital protegido: $${state.capital.toFixed(2)}`);
     state.autoMode = false;

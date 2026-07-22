@@ -370,7 +370,10 @@ async function openTrade(pair, tf, analysis) {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     strategy: analysis.strategy || 'Reversión',
-    atr: analysis.atr || Math.abs(analysis.entry - analysis.sl) / 1.5,
+    // Guardamos el ATR EFECTIVO (la distancia real usada para el SL, ya con el
+    // ajuste de volatilidad del día aplicado) — no el ATR crudo — para que el
+    // trailing stop se active de forma consistente con el TP/SL real de esta operación.
+    atr: Math.abs(analysis.entry - analysis.sl) / 1.5,
     peakPrice: analysis.entry,
     trailingActive: false,
     partialTaken: false,

@@ -32,6 +32,8 @@ const DEFAULT_STATE = {
   positionSizePct: 20, // % del capital por operación individual (probando 10/15/20)
   subSlThresholdMin: 5, // minutos de desacuerdo sostenido en 15m antes de cortar (probando 5/15/30)
   tpAtrMultiplier: 3.0, // qué tan lejos pide el TP en múltiplos de ATR (probando 2/3/4 — el SL siempre es la mitad, R:R 2:1 fijo)
+  cooldownMinutes: 30, // minutos de enfriamiento por par+dirección después de un cierre por Sub-SL
+  pairCooldowns: {}, // { "BTCUSDT-VENDER": timestampHastaElQueEstaBloqueado }
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -554,7 +556,9 @@ async function runAutoCheck() {
           }
           const DISAGREE_THRESHOLD = state.subSlThresholdMin || 5; // minutos de desacuerdo sostenido (chequeo cada 60s ≈ 1 por minuto)
           if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {
-            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.`);
+            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.\n🧊 Este par+dirección queda en enfriamiento ${state.cooldownMinutes || 30} min antes de poder volver a abrirse igual.`);
+            if (!state.pairCooldowns) state.pairCooldowns = {};
+            state.pairCooldowns[t.pair + '-' + t.signal] = Date.now() + (state.cooldownMinutes || 30) * 60 * 1000;
             await closeTradeById(t.id, currentPrice, 'Sub-SL: tendencia 15m en contra');
             continue;
           }
@@ -617,7 +621,16 @@ async function runAutoCheck() {
       const sellCandidate = { ...best, direction: 'VENDER', score: sells.length * best.confidence };
       if (!chosen || sellCandidate.score > chosen.score) chosen = sellCandidate;
     }
-    if (chosen) allSignals.push(chosen);
+    if (chosen) {
+      const cooldownKey = pair + '-' + chosen.direction;
+      const cooldownUntil = (state.pairCooldowns || {})[cooldownKey];
+      const stillCoolingDown = cooldownUntil && Date.now() < cooldownUntil;
+      if (!stillCoolingDown) {
+        allSignals.push(chosen);
+      } else {
+        console.log(`${cooldownKey} en enfriamiento, se salta esta señal (${Math.round((cooldownUntil - Date.now()) / 60000)} min restantes)`);
+      }
+    }
   }
 
   // Open a trade for EVERY free pair with a valid signal (not just the single best) —
@@ -637,7 +650,7 @@ app.get("/state", (req, res) => {
 });
 
 app.post("/state/config", async (req, res) => {
-  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin, tpAtrMultiplier } = req.body;
+  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin, tpAtrMultiplier, cooldownMinutes } = req.body;
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
   if (minConfidence !== undefined) state.minConfidence = minConfidence;
@@ -647,6 +660,7 @@ app.post("/state/config", async (req, res) => {
   if (positionSizePct !== undefined) state.positionSizePct = positionSizePct;
   if (subSlThresholdMin !== undefined) state.subSlThresholdMin = subSlThresholdMin;
   if (tpAtrMultiplier !== undefined) state.tpAtrMultiplier = tpAtrMultiplier;
+  if (cooldownMinutes !== undefined) state.cooldownMinutes = cooldownMinutes;
   await saveState(state);
   res.json({ success: true, state });
 });

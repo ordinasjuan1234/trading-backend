@@ -31,6 +31,7 @@ const DEFAULT_STATE = {
   maxDailyLossPct: 3,
   positionSizePct: 20, // % del capital por operación individual (probando 10/15/20)
   subSlThresholdMin: 5, // minutos de desacuerdo sostenido en 15m antes de cortar (probando 5/15/30)
+  tpAtrMultiplier: 3.0, // qué tan lejos pide el TP en múltiplos de ATR (probando 2/3/4 — el SL siempre es la mitad, R:R 2:1 fijo)
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -267,7 +268,8 @@ function analyzeImproved(closes, highs, lows) {
   }
   let entry = price, tp, sl;
   const vol = calcVolatilityRegime(highs, lows, closes);
-  const slMultiplier = 1.5 * vol.multiplierScale, tpMultiplier = 3.0 * vol.multiplierScale;
+  const baseTp = state.tpAtrMultiplier || 3.0;
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale, tpMultiplier = baseTp * vol.multiplierScale;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
@@ -308,7 +310,8 @@ function analyzeTrendFollow(closes, highs, lows) {
   }
   let entry = price, tp, sl;
   const vol = calcVolatilityRegime(highs, lows, closes);
-  const slMultiplier = 1.5 * vol.multiplierScale, tpMultiplier = 3.0 * vol.multiplierScale;
+  const baseTp = state.tpAtrMultiplier || 3.0;
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale, tpMultiplier = baseTp * vol.multiplierScale;
   if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
@@ -634,7 +637,7 @@ app.get("/state", (req, res) => {
 });
 
 app.post("/state/config", async (req, res) => {
-  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin } = req.body;
+  const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin, tpAtrMultiplier } = req.body;
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
   if (minConfidence !== undefined) state.minConfidence = minConfidence;
@@ -643,6 +646,7 @@ app.post("/state/config", async (req, res) => {
   if (maxDailyLossPct !== undefined) state.maxDailyLossPct = maxDailyLossPct;
   if (positionSizePct !== undefined) state.positionSizePct = positionSizePct;
   if (subSlThresholdMin !== undefined) state.subSlThresholdMin = subSlThresholdMin;
+  if (tpAtrMultiplier !== undefined) state.tpAtrMultiplier = tpAtrMultiplier;
   await saveState(state);
   res.json({ success: true, state });
 });

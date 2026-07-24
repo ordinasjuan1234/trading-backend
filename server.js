@@ -151,6 +151,39 @@ function calcVolatilityRegime(highs, lows, closes) {
   return { regime, ratio, multiplierScale };
 }
 
+// ADX: mide qué tan FUERTE es una tendencia, sin importar la dirección.
+// ADX bajo (<20) = mercado lateral/sin dirección clara — acá es donde las
+// estrategias de tendencia (Reversión/Tendencia) generan señales falsas por
+// leer ruido de cierre como si fuera tendencia real.
+function calcADX(highs, lows, closes, period = 14) {
+  const n = highs.length;
+  if (n < period * 2 + 1) return null;
+  let plusDM = [], minusDM = [], tr = [];
+  for (let i = 1; i < n; i++) {
+    const upMove = highs[i] - highs[i - 1];
+    const downMove = lows[i - 1] - lows[i];
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    tr.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1])));
+  }
+  const wilderSmooth = (arr) => {
+    let smoothed = [arr.slice(0, period).reduce((a, b) => a + b, 0)];
+    for (let i = period; i < arr.length; i++) smoothed.push(smoothed[smoothed.length - 1] - (smoothed[smoothed.length - 1] / period) + arr[i]);
+    return smoothed;
+  };
+  const smoothTR = wilderSmooth(tr), smoothPlusDM = wilderSmooth(plusDM), smoothMinusDM = wilderSmooth(minusDM);
+  const plusDI = smoothPlusDM.map((v, i) => smoothTR[i] > 0 ? (v / smoothTR[i]) * 100 : 0);
+  const minusDI = smoothMinusDM.map((v, i) => smoothTR[i] > 0 ? (v / smoothTR[i]) * 100 : 0);
+  const dx = plusDI.map((v, i) => {
+    const sum = v + minusDI[i];
+    return sum === 0 ? 0 : (Math.abs(v - minusDI[i]) / sum) * 100;
+  });
+  if (dx.length < period) return null;
+  let adx = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dx.length; i++) adx = (adx * (period - 1) + dx[i]) / period;
+  return adx;
+}
+
 function calcATR(h, l, c, p = 14) {
   if (h.length < p + 1) return null;
   let atr = 0;
@@ -261,8 +294,10 @@ function analyzeImproved(closes, highs, lows) {
   const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
   const diff = bull - bear;
   let signal = 'NEUTRO', direction = 'ESPERAR';
-  if (diff >= 4 && isVolatileEnough && !trendDown) { signal = 'COMPRAR'; direction = 'LARGO'; }
-  else if (diff <= -4 && isVolatileEnough && !trendUp) { signal = 'VENDER'; direction = 'SHORT'; }
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal === null || adxVal >= 20; // sin ADX suficiente, no bloqueamos (fallback conservador)
+  if (diff >= 4 && isVolatileEnough && !trendDown && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && !trendUp && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
   const cloud = calcIchimokuCloud(highs, lows, closes);
   if (cloud) {
     if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // resistencia de la nube sin romper
@@ -276,7 +311,7 @@ function analyzeImproved(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr, cloud, volRegime: vol.regime };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Reversión', atr, cloud, volRegime: vol.regime, adx: adxVal };
 }
 
 // Segunda vía de señal: sigue tendencias suaves y sostenidas que la estrategia
@@ -303,8 +338,10 @@ function analyzeTrendFollow(closes, highs, lows) {
   const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
   const diff = bull - bear;
   let signal = 'NEUTRO', direction = 'ESPERAR';
-  if (diff >= 4 && isVolatileEnough) { signal = 'COMPRAR'; direction = 'LARGO'; }
-  else if (diff <= -4 && isVolatileEnough) { signal = 'VENDER'; direction = 'SHORT'; }
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal === null || adxVal >= 20;
+  if (diff >= 4 && isVolatileEnough && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
   const cloud = calcIchimokuCloud(highs, lows, closes);
   if (cloud) {
     if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; } // resistencia de la nube sin romper
@@ -318,7 +355,44 @@ function analyzeTrendFollow(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal };
+}
+
+// Estrategia de RANGO: solo opera cuando el ADX confirma mercado LATERAL
+// (sin tendencia real). En vez de forzar una apuesta direccional que no
+// existe, opera el rebote entre el piso y el techo del rango reciente —
+// compra cerca del piso apuntando al techo, vende cerca del techo apuntando
+// al piso. Objetivos chicos y cierre rápido, no pensada para durar horas.
+function analyzeRango(closes, highs, lows) {
+  const lookback = 15;
+  if (!closes || closes.length < lookback + 20) return null;
+  const adxVal = calcADX(highs, lows, closes);
+  const isLateral = adxVal !== null && adxVal < 20;
+  const recentHighs = highs.slice(-lookback);
+  const recentLows = lows.slice(-lookback);
+  const rangeTop = Math.max(...recentHighs);
+  const rangeBottom = Math.min(...recentLows);
+  const rangeSize = rangeTop - rangeBottom;
+  const price = closes[closes.length - 1];
+  if (rangeSize <= 0) return null;
+  const posInRange = (price - rangeBottom) / rangeSize; // 0 = pegado al piso, 1 = pegado al techo
+  const atr = calcATR(highs, lows, closes) || rangeSize * 0.3;
+
+  let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
+  if (isLateral && posInRange <= 0.15) {
+    signal = 'COMPRAR'; direction = 'LARGO';
+    confidence = Math.round(70 + ((0.15 - posInRange) / 0.15) * 25);
+  } else if (isLateral && posInRange >= 0.85) {
+    signal = 'VENDER'; direction = 'SHORT';
+    confidence = Math.round(70 + ((posInRange - 0.85) / 0.15) * 25);
+  }
+
+  let entry = price, tp, sl;
+  if (signal === 'COMPRAR') { tp = rangeTop - rangeSize * 0.1; sl = rangeBottom - atr * 0.5; }
+  else if (signal === 'VENDER') { tp = rangeBottom + rangeSize * 0.1; sl = rangeTop + atr * 0.5; }
+  else { tp = price + atr; sl = price - atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence, price, entry, tp, sl, rr, strategy: 'Rango', atr, adx: adxVal, rangeTop, rangeBottom };
 }
 
 function analyze(closes, highs, lows) {
@@ -393,7 +467,8 @@ async function openTrade(pair, tf, analysis) {
   const emoji = analysis.signal === 'COMPRAR' ? '🟢' : '🔴';
   const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
   const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  const adxInfo = (analysis.adx !== undefined && analysis.adx !== null) ? `\n📐 ADX: ${analysis.adx.toFixed(1)} (${analysis.adx >= 20 ? 'tendencia confirmada' : 'mercado lateral'})` : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 // Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,
@@ -568,7 +643,7 @@ async function runAutoCheck() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = 48;
+      const MAX_HOURS_OPEN = t.strategy === 'Rango' ? 2 : 48; // el Rango apuesta a un rebote rápido, si no pasó en 2hs el rango ya no es válido
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
@@ -602,6 +677,8 @@ async function runAutoCheck() {
         if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
         const b = analyzeTrendFollow(closes, highs, lows);
         if (b) signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        const c = analyzeRango(closes, highs, lows);
+        if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
     const buys = signals.filter(s => s.signal === 'COMPRAR' && s.confidence >= state.minConfidence);

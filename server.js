@@ -661,6 +661,10 @@ async function runAutoCheck() {
     } catch (e) { console.log('Check open trade error:', e.message); }
   }
 
+  // Si se pausó recién (por ejemplo, 3 pérdidas seguidas cerrándose en este
+  // mismo ciclo), no seguir buscando/abriendo señales nuevas en este mismo pase.
+  if (!state.autoMode) return;
+
   // Look for new signal only on pairs that don't already have an open trade
   const openPairs = new Set(state.openTrades.map(t => t.pair));
   const freePairs = state.autoPairs.filter(p => !openPairs.has(p));
@@ -744,8 +748,9 @@ app.post("/state/config", async (req, res) => {
 
 app.post("/state/toggle-auto", async (req, res) => {
   state.autoMode = !state.autoMode;
+  if (state.autoMode) state.consecutiveLosses = 0; // reactivación manual = arranque fresco, 3 intentos nuevos
   await saveState(state);
-  sendTelegram(state.autoMode ? '▶ Bot automático activado (Servidor 24/7)' : '■ Bot automático detenido (Servidor)');
+  sendTelegram(state.autoMode ? '▶ Bot automático activado (Servidor 24/7) — contador de pérdidas reiniciado' : '■ Bot automático detenido (Servidor)');
   if (state.autoMode) runAutoCheck();
   res.json({ success: true, autoMode: state.autoMode });
 });

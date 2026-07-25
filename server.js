@@ -458,7 +458,7 @@ async function openTrade(pair, tf, analysis) {
     trailingActive: false,
     partialTaken: false,
     trendDisagreeCount: 0,
-    openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
+    openTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires', hour12:false}),
     openTimestamp: Date.now(),
     confidence: analysis.confidence, auto: true
   };
@@ -486,7 +486,7 @@ async function partialCloseTrade(t, exitPrice) {
   const pnlPct = (pnl / halfSize) * 100;
   const closedPortion = {
     ...t, size: halfSize, qty: halfQty, exitPrice, pnl, pnlPct, pnlBeforeFees, commission,
-    closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}),
+    closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires', hour12:false}),
     reason: 'TP Parcial (50%)'
   };
   state.trades.unshift(closedPortion);
@@ -515,7 +515,7 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const commission = t.size * COMMISSION_PCT * 2;
   const pnl = pnlBeforeFees - commission;
   const pnlPct = (pnl / t.size) * 100;
-  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'}), reason };
+  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, closeTime: new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires', hour12:false}), reason };
   state.trades.unshift(closed);
   if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
   state.capital += pnl;
@@ -868,7 +868,7 @@ async function sendDailySummaryMsg() {
   else if (state.dailyPnl < 0 && losses >= 3) motivacion = '💪 Dale vos podés! Mañana es otro día.';
   else if (state.dailyPnl < 0) motivacion = '🔴 Día difícil. Revisá las señales y descansá.';
   else motivacion = '⚪ Día tranquilo. El mercado espera su momento.';
-  const now = new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'});
+  const now = new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires', hour12:false});
   sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L hoy: ${state.dailyPnl>=0?'+':''}$${state.dailyPnl.toFixed(2)}\n🎯 Operaciones hoy: ${state.dailyTrades}\n✅ Ganadas: ${wins}\n❌ Perdidas: ${losses}\n📊 Win Rate: ${winRate}%\n\n${motivacion}`);
   state.dailyPnl = 0; state.dailyTrades = 0;
   await saveState(state);
@@ -986,7 +986,7 @@ app.listen(PORT, async () => {
   console.log(`Backend v2 corriendo en puerto ${PORT} - AUTO 24/7 habilitado`);
   await initMongo();
   scheduleDailySummary();
-  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires'})}\n💾 Persistencia: ${stateCollection ? 'MongoDB conectado ✅' : 'Solo memoria ⚠️'}\n🤖 Modo AUTO: ${state.autoMode ? 'Activo' : 'Inactivo'}`);
+  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${new Date().toLocaleString('es-AR', {timeZone:'America/Argentina/Buenos_Aires', hour12:false})}\n💾 Persistencia: ${stateCollection ? 'MongoDB conectado ✅' : 'Solo memoria ⚠️'}\n🤖 Modo AUTO: ${state.autoMode ? 'Activo' : 'Inactivo'}`);
   // Start the auto-check loop (runs every 60 seconds regardless of browser)
   setInterval(runAutoCheck, 60000);
 });

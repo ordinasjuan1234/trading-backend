@@ -455,7 +455,8 @@ async function fetchKlines(pair, tf, limit = 100) {
   return {
     closes: data.map(k => parseFloat(k[4])),
     highs: data.map(k => parseFloat(k[2])),
-    lows: data.map(k => parseFloat(k[3]))
+    lows: data.map(k => parseFloat(k[3])),
+    volumes: data.map(k => parseFloat(k[5]))
   };
 }
 
@@ -556,6 +557,20 @@ async function closeTradeById(tradeId, exitPrice, reason) {
     state.autoMode = false;
     await saveState(state);
   }
+}
+
+// Confirma si el desacuerdo de tendencia viene con volumen REAL detrás, o si
+// es solo ruido de precio sin fuerza de mercado. Compara el volumen de las
+// últimas velas contra el promedio más largo — si no hay volumen elevado,
+// probablemente sea fluctuación normal, no un giro real.
+function calcVolumeConfirm(volumes, recentN = 5) {
+  if (!volumes || volumes.length < recentN + 10) return true; // sin datos suficientes, no bloqueamos por las dudas
+  const recent = volumes.slice(-recentN);
+  const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
+  const baseline = volumes.slice(0, -recentN);
+  const baselineAvg = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+  if (baselineAvg === 0) return true;
+  return recentAvg >= baselineAvg * 0.9; // el movimiento reciente tiene al menos volumen normal/alto, no está "vacío"
 }
 
 // Mide la tendencia de las últimas 15 velas de 15m — se usa como "vigía" de corto
@@ -683,11 +698,14 @@ async function runAutoCheck() {
       // corto plazo va en contra" es contradecir la lógica misma de la entrada.
       if ((t.tf === '1h' || t.tf === '4h') && !t.trailingActive && t.strategy !== 'Rango') {
         try {
-          const { closes: closes15m } = await fetchKlines(t.pair, '15m', 20);
+          const { closes: closes15m, volumes: volumes15m } = await fetchKlines(t.pair, '15m', 30);
           const shortTrend = calcShortTermTrend(closes15m);
           const contradicts = (t.signal === 'COMPRAR' && shortTrend === 'bajista') || (t.signal === 'VENDER' && shortTrend === 'alcista');
           const notYetProfitable = t.signal === 'COMPRAR' ? currentPrice <= t.entry : currentPrice >= t.entry;
-          if (contradicts && notYetProfitable) {
+          // El desacuerdo solo cuenta si además viene con volumen real detrás —
+          // un movimiento de precio sin volumen suele ser ruido, no un giro genuino.
+          const volumeConfirms = calcVolumeConfirm(volumes15m);
+          if (contradicts && notYetProfitable && volumeConfirms) {
             t.trendDisagreeCount = (t.trendDisagreeCount || 0) + 1;
           } else {
             t.trendDisagreeCount = 0;

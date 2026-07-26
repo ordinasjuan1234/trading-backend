@@ -538,6 +538,12 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   state.dailyPnl += pnl;
   state.dailyTrades += 1;
   if (pnl < 0) state.consecutiveLosses += 1; else state.consecutiveLosses = 0;
+  // Enfriamiento por cualquier pérdida (no solo Sub-SL) — evita reabrir la
+  // misma apuesta perdedora casi al instante si el capital se libera enseguida.
+  if (pnl < 0) {
+    if (!state.pairCooldowns) state.pairCooldowns = {};
+    state.pairCooldowns[t.pair + '-' + t.signal] = Date.now() + (state.cooldownMinutes || 30) * 60 * 1000;
+  }
   state.openTrades.splice(idx, 1);
   await saveState(state);
   const emoji = pnl >= 0 ? '✅' : '❌';
@@ -633,7 +639,10 @@ async function runAutoCheck() {
       // en timeframes más largos (1h/4h). Si el corto plazo viene claramente en
       // contra de forma SOSTENIDA (no un ruido de un momento) y la operación
       // todavía no está en ganancia, se corta antes de llegar al SL completo.
-      if ((t.tf === '1h' || t.tf === '4h') && !t.trailingActive) {
+      // El Sub-SL no aplica a Rango: esa estrategia apuesta A FAVOR de que la
+      // tendencia de corto plazo se agote y revierta — aplicarle "cortá si el
+      // corto plazo va en contra" es contradecir la lógica misma de la entrada.
+      if ((t.tf === '1h' || t.tf === '4h') && !t.trailingActive && t.strategy !== 'Rango') {
         try {
           const { closes: closes15m } = await fetchKlines(t.pair, '15m', 20);
           const shortTrend = calcShortTermTrend(closes15m);

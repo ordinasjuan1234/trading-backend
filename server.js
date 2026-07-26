@@ -655,12 +655,18 @@ async function runAutoCheck() {
       // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
       // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.
       const atr = t.atr || Math.abs(t.entry - t.sl) / 1.5;
-      const ACTIVATION_ATR = 1.0;  // se activa cuando la ganancia flotante llega a 1x ATR
+      const ACTIVATION_ATR = 1.0;  // se activa cuando la ganancia flotante llega a 1x ATR...
+      // ...pero nunca con menos de este piso en %, para asegurar que la ganancia
+      // bruta al activarse sea varias veces mayor que la comisión (0.2% ida y
+      // vuelta) — si no, el trailing/parcial se activa con margen menor al
+      // costo de operar, y cualquier retroceso chico ya deja pérdida neta.
+      const MIN_ACTIVATION_PCT = 0.006; // 0.6% — 3x la comisión de 0.2%
+      const activationDistance = Math.max(atr * ACTIVATION_ATR, t.entry * MIN_ACTIVATION_PCT);
       const TRAIL_DISTANCE_ATR = 1.0; // el SL persigue el precio a 1x ATR de distancia del mejor precio alcanzado
       if (t.signal === 'COMPRAR') {
         if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
-        if (favorableMove >= atr * ACTIVATION_ATR) {
+        if (favorableMove >= activationDistance) {
           const candidateSl = Math.max(t.entry, t.peakPrice - atr * TRAIL_DISTANCE_ATR);
           if (candidateSl > t.sl) {
             const wasActive = t.trailingActive;
@@ -675,7 +681,7 @@ async function runAutoCheck() {
       } else if (t.signal === 'VENDER') {
         if (recentLow < t.peakPrice) t.peakPrice = recentLow;
         const favorableMove = t.entry - t.peakPrice;
-        if (favorableMove >= atr * ACTIVATION_ATR) {
+        if (favorableMove >= activationDistance) {
           const candidateSl = Math.min(t.entry, t.peakPrice + atr * TRAIL_DISTANCE_ATR);
           if (candidateSl < t.sl) {
             const wasActive = t.trailingActive;

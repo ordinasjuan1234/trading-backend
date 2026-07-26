@@ -52,6 +52,9 @@ const DEFAULT_STATE = {
   ghostTrades: [], // posiciones "fantasma": mismas condiciones que un trade cortado por Sub-SL,
                     // pero sin plata real — para medir si el Sub-SL realmente ayuda o perjudica
   ghostResults: [], // historial de resultados fantasma ya resueltos
+  tradingMode: 'demo', // 'demo' | 'testnet' | 'real' — demo es 100% simulado, testnet/real ejecutan órdenes de verdad
+  realModeConfirmed: false, // requiere una confirmación explícita antes de poder activar testnet/real por primera vez
+  killSwitchActive: false, // interruptor de emergencia: fuerza todo a demo y detiene el AUTO
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -99,6 +102,57 @@ async function saveState(newState) {
 }
 
 // ── HMAC ──────────────────────────────────────────────────
+// ── Modo real/testnet: claves SOLO desde variables de entorno del servidor,
+// nunca desde el navegador — mucho más seguro que guardarlas en cookies.
+function getBinanceCredentials(mode) {
+  if (mode === 'testnet') {
+    return {
+      apiKey: process.env.BINANCE_TESTNET_API_KEY,
+      apiSecret: process.env.BINANCE_TESTNET_API_SECRET,
+      baseUrl: 'https://testnet.binance.vision'
+    };
+  }
+  if (mode === 'real') {
+    return {
+      apiKey: process.env.BINANCE_REAL_API_KEY,
+      apiSecret: process.env.BINANCE_REAL_API_SECRET,
+      baseUrl: 'https://api.binance.com'
+    };
+  }
+  return null;
+}
+
+async function getRealBalance(mode) {
+  const creds = getBinanceCredentials(mode);
+  if (!creds || !creds.apiKey || !creds.apiSecret) throw new Error(`Faltan las claves de Binance (${mode}) configuradas en el servidor (variables de entorno)`);
+  const timestamp = Date.now();
+  const query = `timestamp=${timestamp}`;
+  const signature = hmac(creds.apiSecret, query);
+  const response = await fetch(`${creds.baseUrl}/api/v3/account?${query}&signature=${signature}`, {
+    headers: { "X-MBX-APIKEY": creds.apiKey }
+  });
+  const data = await response.json();
+  if (data.code) throw new Error(data.msg || 'Error de Binance');
+  const usdt = data.balances?.find(b => b.asset === "USDT");
+  return usdt ? parseFloat(usdt.free) : 0;
+}
+
+async function placeRealOrder(mode, symbol, side, quantity) {
+  const creds = getBinanceCredentials(mode);
+  if (!creds || !creds.apiKey || !creds.apiSecret) throw new Error(`Faltan las claves de Binance (${mode}) configuradas en el servidor (variables de entorno)`);
+  const timestamp = Date.now();
+  const params = `symbol=${symbol}&side=${side}&type=MARKET&quantity=${quantity}&timestamp=${timestamp}`;
+  const signature = hmac(creds.apiSecret, params);
+  const response = await fetch(`${creds.baseUrl}/api/v3/order`, {
+    method: "POST",
+    headers: { "X-MBX-APIKEY": creds.apiKey, "Content-Type": "application/x-www-form-urlencoded" },
+    body: `${params}&signature=${signature}`
+  });
+  const data = await response.json();
+  if (data.code) throw new Error(data.msg || 'Error de Binance');
+  return data;
+}
+
 function hmac(secret, message) {
   return crypto.createHmac("sha256", secret).update(message).digest("hex");
 }
@@ -881,6 +935,66 @@ app.post("/state/reset", async (req, res) => {
 });
 
 // ── Binance & Telegram routes (existing) ──────────────────
+// ── Selector de modo (demo/testnet/real), confirmación explícita y kill switch ──
+app.post("/mode/confirm", async (req, res) => {
+  const { confirmText } = req.body;
+  if (confirmText !== 'ENTIENDO EL RIESGO') {
+    return res.status(400).json({ error: "Confirmación inválida. Hay que escribir exactamente: ENTIENDO EL RIESGO" });
+  }
+  state.realModeConfirmed = true;
+  await saveState(state);
+  sendTelegram('✅ Confirmación de riesgo real registrada. Ya se puede activar testnet/real.');
+  res.json({ success: true });
+});
+
+app.post("/mode/set", async (req, res) => {
+  const { mode } = req.body;
+  if (!['demo', 'testnet', 'real'].includes(mode)) return res.status(400).json({ error: "Modo inválido" });
+  if (state.killSwitchActive && mode !== 'demo') {
+    return res.status(400).json({ error: "El kill switch está activo — reseteálo primero en /kill/reset antes de volver a testnet/real." });
+  }
+  if (mode !== 'demo' && !state.realModeConfirmed) {
+    return res.status(400).json({ error: "Falta la confirmación explícita de riesgo. Llamá primero a /mode/confirm." });
+  }
+  if (mode !== 'demo') {
+    const creds = getBinanceCredentials(mode);
+    if (!creds || !creds.apiKey || !creds.apiSecret) {
+      return res.status(400).json({ error: `Faltan configurar las variables de entorno de Binance para modo ${mode} en Render.` });
+    }
+  }
+  state.tradingMode = mode;
+  await saveState(state);
+  sendTelegram(`⚙️ Modo de operación cambiado a: ${mode.toUpperCase()}`);
+  res.json({ success: true, tradingMode: state.tradingMode });
+});
+
+app.post("/kill", async (req, res) => {
+  state.killSwitchActive = true;
+  state.tradingMode = 'demo';
+  state.autoMode = false;
+  await saveState(state);
+  sendTelegram('🛑🛑🛑 KILL SWITCH ACTIVADO — todo detenido, modo forzado a DEMO, AUTO pausado.');
+  res.json({ success: true });
+});
+
+app.post("/kill/reset", async (req, res) => {
+  state.killSwitchActive = false;
+  await saveState(state);
+  sendTelegram('🔓 Kill switch reseteado. Seguís en modo DEMO hasta que elijas otro modo.');
+  res.json({ success: true });
+});
+
+app.post("/real-balance", async (req, res) => {
+  const { mode } = req.body;
+  if (!['testnet', 'real'].includes(mode)) return res.status(400).json({ error: "Modo inválido" });
+  try {
+    const usdt = await getRealBalance(mode);
+    res.json({ success: true, usdt });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/balance", async (req, res) => {
   const { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret) return res.status(400).json({ error: "Faltan claves" });

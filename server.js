@@ -984,12 +984,37 @@ app.post("/kill/reset", async (req, res) => {
   res.json({ success: true });
 });
 
+async function getAllBalances(mode) {
+  const creds = getBinanceCredentials(mode);
+  if (!creds || !creds.apiKey || !creds.apiSecret) throw new Error(`Faltan las claves de Binance (${mode}) configuradas en el servidor`);
+  const timestamp = Date.now();
+  const query = `timestamp=${timestamp}`;
+  const signature = hmac(creds.apiSecret, query);
+  const response = await fetch(`${creds.baseUrl}/api/v3/account?${query}&signature=${signature}`, {
+    headers: { "X-MBX-APIKEY": creds.apiKey }
+  });
+  const data = await response.json();
+  if (data.code) throw new Error(data.msg || 'Error de Binance');
+  return (data.balances || []).filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
+}
+
 app.post("/real-balance", async (req, res) => {
   const { mode } = req.body;
   if (!['testnet', 'real'].includes(mode)) return res.status(400).json({ error: "Modo inválido" });
   try {
     const usdt = await getRealBalance(mode);
     res.json({ success: true, usdt });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/real-balance-all", async (req, res) => {
+  const { mode } = req.body;
+  if (!['testnet', 'real'].includes(mode)) return res.status(400).json({ error: "Modo inválido" });
+  try {
+    const balances = await getAllBalances(mode);
+    res.json({ success: true, balances });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

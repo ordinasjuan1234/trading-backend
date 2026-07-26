@@ -49,6 +49,9 @@ const DEFAULT_STATE = {
   tpAtrMultiplier: 3.0, // qué tan lejos pide el TP en múltiplos de ATR (probando 2/3/4 — el SL siempre es la mitad, R:R 2:1 fijo)
   cooldownMinutes: 30, // minutos de enfriamiento por par+dirección después de un cierre por Sub-SL
   pairCooldowns: {}, // { "BTCUSDT-VENDER": timestampHastaElQueEstaBloqueado }
+  ghostTrades: [], // posiciones "fantasma": mismas condiciones que un trade cortado por Sub-SL,
+                    // pero sin plata real — para medir si el Sub-SL realmente ayuda o perjudica
+  ghostResults: [], // historial de resultados fantasma ya resueltos
   consecutiveLosses: 0,
   lastResetDate: new Date().toDateString()
 };
@@ -569,6 +572,42 @@ function calcShortTermTrend(closes) {
   return 'neutral';
 }
 
+// Revisa cada posición fantasma (creada cuando el Sub-SL cortó una operación
+// de Tendencia/Reversión) contra su TP/SL ORIGINAL, sin tocar plata real.
+// Sirve para responder con datos: "¿el Sub-SL nos salvó de una pérdida mayor,
+// o nos sacó de una operación que igual hubiera ganado?"
+async function checkGhostTrades() {
+  if (!state.ghostTrades || state.ghostTrades.length === 0) return;
+  for (const g of [...state.ghostTrades]) {
+    try {
+      const { highs, lows } = await fetchKlines(g.pair, "1m", 3);
+      const recentHigh = Math.max(...highs);
+      const recentLow = Math.min(...lows);
+      const hoursOpen = (Date.now() - g.ghostStartTimestamp) / (1000 * 60 * 60);
+      let resolved = null, hypotheticalExit = null;
+      if (g.signal === 'COMPRAR' && recentHigh >= g.tp) { resolved = 'TP'; hypotheticalExit = g.tp; }
+      else if (g.signal === 'COMPRAR' && recentLow <= g.sl) { resolved = 'SL'; hypotheticalExit = g.sl; }
+      else if (g.signal === 'VENDER' && recentLow <= g.tp) { resolved = 'TP'; hypotheticalExit = g.tp; }
+      else if (g.signal === 'VENDER' && recentHigh >= g.sl) { resolved = 'SL'; hypotheticalExit = g.sl; }
+      else if (hoursOpen >= 48) { resolved = 'TIEMPO'; hypotheticalExit = g.signal === 'COMPRAR' ? recentHigh : recentLow; }
+
+      if (resolved) {
+        const pricePct = g.signal === 'COMPRAR' ? (hypotheticalExit - g.entry) / g.entry : (g.entry - hypotheticalExit) / g.entry;
+        const commission = g.size * 0.001 * 2;
+        const hypotheticalPnl = (g.size * pricePct) - commission;
+        const idx = state.ghostTrades.findIndex(x => x.id === g.id);
+        if (idx > -1) state.ghostTrades.splice(idx, 1);
+        if (!state.ghostResults) state.ghostResults = [];
+        state.ghostResults.unshift({ ...g, resolved, hypotheticalExit, hypotheticalPnl, resolveTime: formatArgTime(new Date()) });
+        if (state.ghostResults.length > 200) state.ghostResults = state.ghostResults.slice(0, 200);
+        await saveState(state);
+        const habriaGanado = hypotheticalPnl >= 0;
+        sendTelegram(`👻 RESULTADO FANTASMA (Sub-SL)\n${g.pair.replace('USDT','/USDT')} · ${g.tf} · ${g.strategy}\nSi NO hubiéramos cortado esta operación, habría cerrado en ${resolved} con ${habriaGanado ? 'GANANCIA' : 'PÉRDIDA'} hipotética de ${hypotheticalPnl>=0?'+':''}$${hypotheticalPnl.toFixed(2)}\n(Esto es solo comparación — no afectó tu capital real)`);
+      }
+    } catch (e) { console.log('Ghost check error:', e.message); }
+  }
+}
+
 async function runAutoCheck() {
   if (!state.autoMode) return;
   const today = new Date().toDateString();
@@ -655,9 +694,20 @@ async function runAutoCheck() {
           }
           const DISAGREE_THRESHOLD = state.subSlThresholdMin || 5; // minutos de desacuerdo sostenido (chequeo cada 60s ≈ 1 por minuto)
           if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {
-            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.\n🧊 Este par+dirección queda en enfriamiento ${state.cooldownMinutes || 30} min antes de poder volver a abrirse igual.`);
+            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.\n🧊 Este par+dirección queda en enfriamiento ${state.cooldownMinutes || 30} min antes de poder volver a abrirse igual.\n👻 Arrancamos un seguimiento fantasma (sin plata real) para ver qué hubiera pasado si no cortábamos acá.`);
             if (!state.pairCooldowns) state.pairCooldowns = {};
             state.pairCooldowns[t.pair + '-' + t.signal] = Date.now() + (state.cooldownMinutes || 30) * 60 * 1000;
+            // Como el trailing todavía no estaba activo (condición de arriba),
+            // t.tp/t.sl siguen siendo los originales de la entrada — perfecto
+            // para el seguimiento fantasma.
+            if (!state.ghostTrades) state.ghostTrades = [];
+            state.ghostTrades.push({
+              id: t.id + '-ghost-' + Date.now(),
+              pair: t.pair, signal: t.signal, direction: t.direction, tf: t.tf, strategy: t.strategy,
+              entry: t.entry, tp: t.tp, sl: t.sl, size: t.size,
+              realExitPrice: currentPrice,
+              ghostStartTimestamp: Date.now()
+            });
             await closeTradeById(t.id, currentPrice, 'Sub-SL: tendencia 15m en contra');
             continue;
           }
@@ -685,8 +735,10 @@ async function runAutoCheck() {
     } catch (e) { console.log('Check open trade error:', e.message); }
   }
 
-  // Si se pausó recién (por ejemplo, 3 pérdidas seguidas cerrándose en este
-  // mismo ciclo), no seguir buscando/abriendo señales nuevas en este mismo pase.
+  // Nota: si el bot está pausado (autoMode false), esta función ni siquiera
+  // llega hasta acá — el seguimiento fantasma también queda en pausa, igual
+  // que el monitoreo de operaciones abiertas (limitación ya conocida).
+  await checkGhostTrades();
   if (!state.autoMode) return;
 
   // Look for new signal only on pairs that don't already have an open trade

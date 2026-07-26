@@ -1020,6 +1020,19 @@ app.post("/real-balance-all", async (req, res) => {
   }
 });
 
+app.post("/real-order-test", async (req, res) => {
+  const { mode } = req.body;
+  if (!['testnet', 'real'].includes(mode)) return res.status(400).json({ error: "Modo inválido" });
+  try {
+    // Orden mínima de prueba — si falla por saldo insuficiente, confirma que
+    // la conexión/firma/autenticación funcionan perfecto de punta a punta.
+    const data = await placeRealOrder(mode, 'BTCUSDT', 'BUY', '0.001');
+    res.json({ success: true, data });
+  } catch (e) {
+    res.json({ success: false, error: e.message, note: 'Si el error dice algo de saldo/balance insuficiente, la conexión SÍ funciona — solo falta plata de prueba en la cuenta.' });
+  }
+});
+
 app.post("/balance", async (req, res) => {
   const { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret) return res.status(400).json({ error: "Faltan claves" });

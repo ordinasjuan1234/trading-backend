@@ -49,6 +49,7 @@ const DEFAULT_STATE = {
   tpAtrMultiplier: 3.0, // qué tan lejos pide el TP en múltiplos de ATR (probando 2/3/4 — el SL siempre es la mitad, R:R 2:1 fijo)
   cooldownMinutes: 30, // minutos de enfriamiento por par+dirección después de un cierre por Sub-SL
   pairCooldowns: {}, // { "BTCUSDT-VENDER": timestampHastaElQueEstaBloqueado }
+  subSlStreak: {}, // { "BTCUSDT-COMPRAR": 2 } — cuántas veces seguidas se repitió el mismo Sub-SL en esa dirección
   ghostTrades: [], // posiciones "fantasma": mismas condiciones que un trade cortado por Sub-SL,
                     // pero sin plata real — para medir si el Sub-SL realmente ayuda o perjudica
   ghostResults: [], // historial de resultados fantasma ya resueltos
@@ -592,6 +593,13 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   state.trades.unshift(closed);
   if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
   state.capital += pnl;
+  // Si esta vez NO se cortó por Sub-SL, la racha de "el 1h insiste en la misma
+  // apuesta y el corto plazo la desmiente" quedó rota — reseteamos el enfriamiento
+  // escalonado para esa dirección.
+  if (!reason.includes('Sub-SL')) {
+    const streakKey = t.pair + '-' + t.signal;
+    if (state.subSlStreak && state.subSlStreak[streakKey]) state.subSlStreak[streakKey] = 0;
+  }
   if (state.capital < 0) state.capital = 0;
   state.dailyPnl += pnl;
   state.dailyTrades += 1;
@@ -677,7 +685,28 @@ async function checkGhostTrades() {
   }
 }
 
+// Candado anti-solapamiento: si una revisión todavía está corriendo (por ej.
+// porque tardó más de 60s en llamadas a Binance), la siguiente NO arranca
+// encima — se salta ese ciclo y espera al próximo. Esto es lo que evitaba que
+// dos revisiones simultáneas vieran "el par está libre" a la vez y abrieran
+// la misma operación duplicada (el bug de las 4 operaciones idénticas).
+let isAutoCheckRunning = false;
 async function runAutoCheck() {
+  if (isAutoCheckRunning) {
+    console.log('runAutoCheck: la revisión anterior todavía está en curso, se saltea este ciclo.');
+    return;
+  }
+  isAutoCheckRunning = true;
+  try {
+    await runAutoCheckInner();
+  } catch (e) {
+    console.log('Error en runAutoCheck:', e.message);
+  } finally {
+    isAutoCheckRunning = false;
+  }
+}
+
+async function runAutoCheckInner() {
   if (!state.autoMode) return;
   const today = new Date().toDateString();
   if (state.lastResetDate !== today) {
@@ -772,9 +801,19 @@ async function runAutoCheck() {
           }
           const DISAGREE_THRESHOLD = state.subSlThresholdMin || 5; // minutos de desacuerdo sostenido (chequeo cada 60s ≈ 1 por minuto)
           if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {
-            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.\n🧊 Este par+dirección queda en enfriamiento ${state.cooldownMinutes || 30} min antes de poder volver a abrirse igual.\n👻 Arrancamos un seguimiento fantasma (sin plata real) para ver qué hubiera pasado si no cortábamos acá.`);
+            // Enfriamiento escalonado: si el MISMO par+dirección viene de cortarse
+            // por Sub-SL varias veces seguidas (ej: el 1h "no se entera" todavía
+            // de que la tendencia giró y sigue reabriendo la misma apuesta), cada
+            // repetición duplica el enfriamiento — hasta un tope de 4 horas.
+            if (!state.subSlStreak) state.subSlStreak = {};
+            const streakKey = t.pair + '-' + t.signal;
+            state.subSlStreak[streakKey] = (state.subSlStreak[streakKey] || 0) + 1;
+            const streak = state.subSlStreak[streakKey];
+            const baseCooldown = state.cooldownMinutes || 30;
+            const escalatedCooldown = Math.min(baseCooldown * Math.pow(2, streak - 1), 240);
+            sendTelegram(`⚠️ CIERRE ANTICIPADO (Sub-SL por tendencia 15m)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nLas últimas 15 velas de 15m vienen sostenidamente ${shortTrend === 'bajista' ? 'a la baja' : 'al alza'}, en contra de esta operación (${t.signal}).\nSe cerró antes de llegar al SL completo, para no seguir esperando si el corto plazo ya lo está desmintiendo.\n🧊 Este par+dirección queda en enfriamiento ${escalatedCooldown} min (racha: ${streak}${streak > 1 ? ' seguidas — se duplicó el enfriamiento' : ''}).\n👻 Arrancamos un seguimiento fantasma (sin plata real) para ver qué hubiera pasado si no cortábamos acá.`);
             if (!state.pairCooldowns) state.pairCooldowns = {};
-            state.pairCooldowns[t.pair + '-' + t.signal] = Date.now() + (state.cooldownMinutes || 30) * 60 * 1000;
+            state.pairCooldowns[streakKey] = Date.now() + escalatedCooldown * 60 * 1000;
             // Como el trailing todavía no estaba activo (condición de arriba),
             // t.tp/t.sl siguen siendo los originales de la entrada — perfecto
             // para el seguimiento fantasma.

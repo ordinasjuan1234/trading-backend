@@ -514,6 +514,31 @@ function analyzeRango(closes, highs, lows) {
   return { signal, direction, confidence, price, entry, tp, sl, rr, strategy: 'Rango', atr, adx: adxVal, rangeTop, rangeBottom };
 }
 
+// Correlación de Pearson entre los retornos (% de cambio vela a vela) de dos
+// activos — mide qué tan pegados se mueven. 1 = siempre juntos, 0 = sin
+// relación, -1 = siempre opuestos. Las criptos grandes suelen estar muy
+// correlacionadas (BTC/ETH típicamente > 0.7), así que abrir la MISMA
+// dirección en las dos es, en la práctica, una sola apuesta duplicada.
+function calcCorrelation(closesA, closesB) {
+  const n = Math.min(closesA.length, closesB.length);
+  if (n < 20) return null;
+  const a = closesA.slice(-n), b = closesB.slice(-n);
+  const retA = [], retB = [];
+  for (let i = 1; i < n; i++) {
+    retA.push((a[i] - a[i - 1]) / a[i - 1]);
+    retB.push((b[i] - b[i - 1]) / b[i - 1]);
+  }
+  const avg = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const meanA = avg(retA), meanB = avg(retB);
+  let num = 0, denA = 0, denB = 0;
+  for (let i = 0; i < retA.length; i++) {
+    const da = retA[i] - meanA, db = retB[i] - meanB;
+    num += da * db; denA += da * da; denB += db * db;
+  }
+  const den = Math.sqrt(denA * denB);
+  return den === 0 ? 0 : num / den;
+}
+
 function analyze(closes, highs, lows) {
   if (!closes || closes.length < 30) return null;
   const price = closes[closes.length - 1];
@@ -945,9 +970,26 @@ async function runAutoCheckInner() {
       const cooldownKey = pair + '-' + chosen.direction;
       const cooldownUntil = (state.pairCooldowns || {})[cooldownKey];
       const stillCoolingDown = cooldownUntil && Date.now() < cooldownUntil;
-      if (!stillCoolingDown) {
+      // Filtro de correlación: si ya hay una operación abierta en OTRO par
+      // monitoreado, en la MISMA dirección, y los dos activos vienen muy
+      // correlacionados (>0.7), abrir esta segunda es duplicar la misma
+      // apuesta con otro nombre — no diversifica de verdad el riesgo.
+      let blockedByCorrelation = false;
+      const sameDirectionOther = state.openTrades.find(t => t.pair !== pair && t.signal === chosen.direction);
+      if (sameDirectionOther && !stillCoolingDown) {
+        try {
+          const dataA = await fetchKlines(pair, '1h', 50);
+          const dataB = await fetchKlines(sameDirectionOther.pair, '1h', 50);
+          const corr = calcCorrelation(dataA.closes, dataB.closes);
+          if (corr !== null && corr > 0.7) {
+            blockedByCorrelation = true;
+            console.log(`${pair} bloqueado por correlación con ${sameDirectionOther.pair} (${corr.toFixed(2)}) — misma dirección, no diversifica`);
+          }
+        } catch (e) { console.log('Correlation check error:', e.message); }
+      }
+      if (!stillCoolingDown && !blockedByCorrelation) {
         allSignals.push(chosen);
-      } else {
+      } else if (stillCoolingDown) {
         console.log(`${cooldownKey} en enfriamiento, se salta esta señal (${Math.round((cooldownUntil - Date.now()) / 60000)} min restantes)`);
       }
     }

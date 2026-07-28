@@ -587,19 +587,72 @@ async function fetchKlines(pair, tf, limit = 100) {
 }
 
 // ── Auto trading loop (runs server-side, 24/7) ────────────
+// Redondea la cantidad al número de decimales que Binance suele aceptar para
+// cada par (regla LOT_SIZE) — sin esto, una orden real puede ser rechazada
+// por tener más precisión de la permitida.
+function roundQtyForBinance(pair, qty) {
+  const decimals = { BTCUSDT: 5, ETHUSDT: 4 }[pair] ?? 3;
+  const factor = Math.pow(10, decimals);
+  return Math.floor(qty * factor) / factor;
+}
+
+// Extrae el precio promedio REAL de ejecución de una orden de Binance (usa
+// cummulativeQuoteQty/executedQty, que es más preciso que el precio "price"
+// del pedido, sobre todo en órdenes MARKET que se llenan a varios precios).
+function extractFillPrice(orderResult, fallbackPrice) {
+  const qty = parseFloat(orderResult.executedQty);
+  const quote = parseFloat(orderResult.cummulativeQuoteQty);
+  if (qty > 0 && quote > 0) return quote / qty;
+  return fallbackPrice;
+}
+
 async function openTrade(pair, tf, analysis) {
   const pct = state.positionSizePct || 20;
-  const size = state.capital * (pct / 100);
-  const qty = analysis.entry > 0 ? size / analysis.entry : 0;
+  // En Testnet/Real, el tamaño se calcula sobre el saldo REAL de la cuenta de
+  // Binance — no sobre el capital simulado interno, que no tiene relación
+  // con la plata de verdad una vez que empezamos a operar ahí.
+  let capitalBase = state.capital;
+  if (state.tradingMode !== 'demo' && !state.killSwitchActive) {
+    try {
+      capitalBase = await getRealBalance(state.tradingMode);
+    } catch (e) {
+      sendTelegram(`⚠️ No se pudo leer el saldo real de ${state.tradingMode.toUpperCase()} para calcular el tamaño — se saltea esta señal.\nMotivo: ${e.message}`);
+      return;
+    }
+  }
+  const size = capitalBase * (pct / 100);
+  let qty = analysis.entry > 0 ? size / analysis.entry : 0;
+  let realEntry = analysis.entry;
+
+  // ── Ejecución real (Testnet/Real): abre la posición de verdad en Binance ──
+  if (state.tradingMode !== 'demo' && !state.killSwitchActive) {
+    qty = roundQtyForBinance(pair, qty);
+    if (qty <= 0) {
+      console.log(`Cantidad calculada demasiado chica para ${pair}, se saltea la apertura real.`);
+      return;
+    }
+    const side = analysis.signal === 'COMPRAR' ? 'BUY' : 'SELL';
+    try {
+      const order = await placeRealOrder(state.tradingMode, pair, side, qty);
+      realEntry = extractFillPrice(order, analysis.entry);
+      qty = parseFloat(order.executedQty) || qty;
+      sendTelegram(`✅ ORDEN REAL EJECUTADA (${state.tradingMode.toUpperCase()})\n${pair.replace('USDT','/USDT')} · ${side}\nCantidad: ${qty} · Precio real: $${realEntry.toFixed(2)}`);
+    } catch (e) {
+      sendTelegram(`❌ FALLÓ LA ORDEN REAL (${state.tradingMode.toUpperCase()})\n${pair.replace('USDT','/USDT')} · No se abrió ninguna posición.\nMotivo: ${e.message}`);
+      console.log('Error al abrir orden real:', e.message);
+      return; // no se crea el trade si la orden real falló
+    }
+  }
+
   const trade = {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
-    entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
+    entry: realEntry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     strategy: analysis.strategy || 'Reversión',
     // Guardamos el ATR EFECTIVO (la distancia real usada para el SL, ya con el
     // ajuste de volatilidad del día aplicado) — no el ATR crudo — para que el
     // trailing stop se active de forma consistente con el TP/SL real de esta operación.
     atr: Math.abs(analysis.entry - analysis.sl) / 1.5,
-    peakPrice: analysis.entry,
+    peakPrice: realEntry,
     trailingActive: false,
     partialTaken: false,
     trendDisagreeCount: 0,
@@ -613,7 +666,7 @@ async function openTrade(pair, tf, analysis) {
   const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
   const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
   const adxInfo = (analysis.adx !== undefined && analysis.adx !== null) ? `\n📐 ADX: ${analysis.adx.toFixed(1)} (${analysis.adx >= 20 ? 'tendencia confirmada' : 'mercado lateral'})` : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}\n💵 Entrada: $${analysis.entry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 // Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,
@@ -622,7 +675,24 @@ async function openTrade(pair, tf, analysis) {
 async function partialCloseTrade(t, exitPrice) {
   const halfSize = t.size / 2;
   const halfQty = t.qty / 2;
-  const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
+  let realExitPrice = exitPrice;
+
+  // ── Ejecución real (Testnet/Real): cierra la mitad de la posición de verdad ──
+  if (state.tradingMode !== 'demo' && !state.killSwitchActive) {
+    const closeSide = t.signal === 'COMPRAR' ? 'SELL' : 'BUY'; // opuesto a como se abrió
+    const roundedHalfQty = roundQtyForBinance(t.pair, halfQty);
+    if (roundedHalfQty > 0) {
+      try {
+        const order = await placeRealOrder(state.tradingMode, t.pair, closeSide, roundedHalfQty);
+        realExitPrice = extractFillPrice(order, exitPrice);
+      } catch (e) {
+        sendTelegram(`❌ FALLÓ EL CIERRE PARCIAL REAL (${state.tradingMode.toUpperCase()})\n${t.pair.replace('USDT','/USDT')}\nMotivo: ${e.message}\nLa mitad de la posición sigue abierta de verdad en Binance, aunque acá se registre como cerrada — revisar manualmente.`);
+        console.log('Error al cerrar parcial real:', e.message);
+      }
+    }
+  }
+
+  const pricePct = t.signal === 'COMPRAR' ? (realExitPrice - t.entry) / t.entry : (t.entry - realExitPrice) / t.entry;
   const rawPnl = halfSize * pricePct;
   const pnlBeforeFees = Math.max(-halfSize, Math.min(rawPnl, halfSize * 5));
   const COMMISSION_PCT = 0.001;
@@ -630,7 +700,7 @@ async function partialCloseTrade(t, exitPrice) {
   const pnl = pnlBeforeFees - commission;
   const pnlPct = (pnl / halfSize) * 100;
   const closedPortion = {
-    ...t, size: halfSize, qty: halfQty, exitPrice, pnl, pnlPct, pnlBeforeFees, commission,
+    ...t, size: halfSize, qty: halfQty, exitPrice: realExitPrice, pnl, pnlPct, pnlBeforeFees, commission,
     closeTime: formatArgTime(new Date()),
     reason: 'TP Parcial (50%)'
   };
@@ -652,6 +722,22 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const idx = state.openTrades.findIndex(t => t.id === tradeId);
   if (idx === -1) return;
   const t = state.openTrades[idx];
+
+  // ── Ejecución real (Testnet/Real): cierra la posición de verdad en Binance ──
+  if (state.tradingMode !== 'demo' && !state.killSwitchActive) {
+    const closeSide = t.signal === 'COMPRAR' ? 'SELL' : 'BUY'; // opuesto a como se abrió
+    const roundedQty = roundQtyForBinance(t.pair, t.qty);
+    if (roundedQty > 0) {
+      try {
+        const order = await placeRealOrder(state.tradingMode, t.pair, closeSide, roundedQty);
+        exitPrice = extractFillPrice(order, exitPrice);
+      } catch (e) {
+        sendTelegram(`❌ FALLÓ EL CIERRE REAL (${state.tradingMode.toUpperCase()})\n${t.pair.replace('USDT','/USDT')}\nMotivo: ${e.message}\nLa posición sigue abierta de verdad en Binance, aunque acá se registre como cerrada — revisar manualmente cuanto antes.`);
+        console.log('Error al cerrar orden real:', e.message);
+      }
+    }
+  }
+
   const pricePct = t.signal === 'COMPRAR' ? (exitPrice - t.entry) / t.entry : (t.entry - exitPrice) / t.entry;
   const rawPnl = t.size * pricePct;
   const pnlBeforeFees = Math.max(-t.size, Math.min(rawPnl, t.size * 5));

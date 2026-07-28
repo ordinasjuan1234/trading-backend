@@ -1093,6 +1093,30 @@ app.get("/", (req, res) => {
   res.json({ status: "Signal Bot Backend OK", time: new Date().toISOString(), autoMode: state.autoMode });
 });
 
+app.get("/stats/all-modes", async (req, res) => {
+  try {
+    const modes = ['demo', 'testnet', 'real'];
+    const result = {};
+    for (const mode of modes) {
+      const trades = (mode === state.tradingMode)
+        ? state.trades
+        : (stateCollection ? (await loadFinancialDoc(mode)).trades : []);
+      const total = trades.length;
+      const wins = trades.filter(t => t.pnl >= 0).length;
+      result[mode] = {
+        total,
+        wins,
+        losses: total - wins,
+        winRate: total > 0 ? Math.round((wins / total) * 1000) / 10 : 0,
+        pnlTotal: Math.round(trades.reduce((s, t) => s + t.pnl, 0) * 100) / 100
+      };
+    }
+    res.json({ success: true, stats: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/state", (req, res) => {
   res.json(state);
 });

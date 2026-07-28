@@ -65,6 +65,29 @@ let mongoClient = null;
 let stateCollection = null;
 let state = { ...DEFAULT_STATE };
 
+// Campos que se COMPARTEN entre demo/testnet/real (la configuración del bot es
+// la misma sin importar el modo — no tendría sentido operar distinto en cada uno).
+const CONFIG_FIELDS = ['autoMode', 'autoPairs', 'autoTFs', 'minConfidence', 'requireMTF',
+  'maxDailyGainPct', 'maxDailyLossPct', 'positionSizePct', 'subSlThresholdMin',
+  'tpAtrMultiplier', 'cooldownMinutes', 'tradingMode', 'realModeConfirmed', 'killSwitchActive'];
+
+// Campos FINANCIEROS: estos sí quedan completamente separados por modo — el
+// capital, historial y operaciones de demo nunca se mezclan con los de testnet/real.
+const FINANCIAL_FIELDS = ['capital', 'trades', 'openTrades', 'dailyPnl', 'dailyTrades',
+  'consecutiveLosses', 'pairCooldowns', 'subSlStreak', 'ghostTrades', 'ghostResults', 'lastResetDate'];
+
+function freshFinancialState() {
+  const fresh = {};
+  for (const f of FINANCIAL_FIELDS) fresh[f] = DEFAULT_STATE[f];
+  return fresh;
+}
+
+async function loadFinancialDoc(mode) {
+  const doc = await stateCollection.findOne({ _id: 'financial_' + mode });
+  if (doc) { delete doc._id; return { ...freshFinancialState(), ...doc }; }
+  return freshFinancialState();
+}
+
 async function initMongo() {
   if (!MONGODB_URI) {
     console.log("MONGODB_URI no configurado - usando estado solo en memoria (se pierde al reiniciar)");
@@ -76,15 +99,37 @@ async function initMongo() {
     const db = mongoClient.db("signalbot");
     stateCollection = db.collection("bot_state");
     console.log("MongoDB conectado correctamente");
-    const saved = await stateCollection.findOne({ _id: "main" });
-    if (saved) {
-      delete saved._id;
-      state = { ...DEFAULT_STATE, ...saved };
-      console.log("Estado cargado desde MongoDB - Capital:", state.capital);
+
+    // 1) Config compartida
+    let config = {};
+    const configDoc = await stateCollection.findOne({ _id: "config" });
+    if (configDoc) {
+      delete configDoc._id;
+      for (const f of CONFIG_FIELDS) config[f] = configDoc[f] !== undefined ? configDoc[f] : DEFAULT_STATE[f];
     } else {
-      await stateCollection.insertOne({ _id: "main", ...DEFAULT_STATE });
-      console.log("Estado inicial creado en MongoDB");
+      for (const f of CONFIG_FIELDS) config[f] = DEFAULT_STATE[f];
+      await stateCollection.insertOne({ _id: "config", ...config });
     }
+
+    // 2) Datos financieros del modo que estaba activo (demo/testnet/real, cada uno en su propio documento)
+    const financial = await loadFinancialDoc(config.tradingMode || 'demo');
+    state = { ...DEFAULT_STATE, ...config, ...financial };
+
+    // Migración de compatibilidad: si existe el documento viejo "main" (antes de
+    // separar por modo) y todavía no hay nada guardado en "financial_demo",
+    // migramos su capital/trades una sola vez para no perder el historial.
+    const oldMain = await stateCollection.findOne({ _id: "main" });
+    const demoFinancialExists = await stateCollection.findOne({ _id: "financial_demo" });
+    if (oldMain && !demoFinancialExists) {
+      delete oldMain._id;
+      const migratedFinancial = {};
+      for (const f of FINANCIAL_FIELDS) migratedFinancial[f] = oldMain[f] !== undefined ? oldMain[f] : DEFAULT_STATE[f];
+      await stateCollection.updateOne({ _id: "financial_demo" }, { $set: migratedFinancial }, { upsert: true });
+      if ((config.tradingMode || 'demo') === 'demo') state = { ...state, ...migratedFinancial };
+      console.log("Migración: historial del documento viejo 'main' copiado a 'financial_demo'");
+    }
+
+    console.log("Estado cargado desde MongoDB - Modo:", state.tradingMode, "- Capital:", state.capital);
   } catch (e) {
     console.log("Error conectando MongoDB:", e.message);
   }
@@ -94,11 +139,12 @@ async function saveState(newState) {
   state = newState;
   if (!stateCollection) return;
   try {
-    await stateCollection.updateOne(
-      { _id: "main" },
-      { $set: { ...state } },
-      { upsert: true }
-    );
+    const configPart = {};
+    for (const f of CONFIG_FIELDS) configPart[f] = state[f];
+    const financialPart = {};
+    for (const f of FINANCIAL_FIELDS) financialPart[f] = state[f];
+    await stateCollection.updateOne({ _id: "config" }, { $set: configPart }, { upsert: true });
+    await stateCollection.updateOne({ _id: "financial_" + state.tradingMode }, { $set: financialPart }, { upsert: true });
   } catch (e) { console.log("Save state error:", e.message); }
 }
 
@@ -1001,16 +1047,28 @@ app.post("/mode/set", async (req, res) => {
       return res.status(400).json({ error: `Faltan configurar las variables de entorno de Binance para modo ${mode} en Render.` });
     }
   }
-  state.tradingMode = mode;
+  const previousMode = state.tradingMode;
+  if (previousMode !== mode) {
+    // Guardamos el financiero del modo viejo antes de irnos, así no se pierde nada
+    await saveState(state);
+    // Cargamos el financiero SEPARADO del modo nuevo — el capital/historial de
+    // cada modo nunca se mezcla con el de los otros dos.
+    const financial = stateCollection ? await loadFinancialDoc(mode) : freshFinancialState();
+    state = { ...state, ...financial, tradingMode: mode };
+  }
   await saveState(state);
-  sendTelegram(`⚙️ Modo de operación cambiado a: ${mode.toUpperCase()}`);
-  res.json({ success: true, tradingMode: state.tradingMode });
+  sendTelegram(`⚙️ Modo de operación cambiado a: ${mode.toUpperCase()}\n💰 Capital de este modo: $${state.capital.toFixed(2)}`);
+  res.json({ success: true, tradingMode: state.tradingMode, capital: state.capital });
 });
 
 app.post("/kill", async (req, res) => {
   state.killSwitchActive = true;
-  state.tradingMode = 'demo';
   state.autoMode = false;
+  if (state.tradingMode !== 'demo') {
+    await saveState(state); // guarda el financiero del modo que se estaba usando
+    const demoFinancial = stateCollection ? await loadFinancialDoc('demo') : freshFinancialState();
+    state = { ...state, ...demoFinancial, tradingMode: 'demo' };
+  }
   await saveState(state);
   sendTelegram('🛑🛑🛑 KILL SWITCH ACTIVADO — todo detenido, modo forzado a DEMO, AUTO pausado.');
   res.json({ success: true });

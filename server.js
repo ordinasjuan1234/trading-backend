@@ -362,6 +362,52 @@ function calcRSISeries(c, p = 14) {
   }
   return rsiValues;
 }
+// Estrategia REBOTE: detecta divergencia entre el precio y el RSI en 15m —
+// si el precio hace un mínimo más bajo pero el RSI hace un mínimo MÁS ALTO
+// (el impulso vendedor se está agotando aunque el precio siga cayendo), es
+// una señal de rebote de corto plazo. Funciona DENTRO de cualquier tendencia
+// mayor (no necesita que el mercado esté lateral, a diferencia de Rango) —
+// pensada para resolverse en 15-30 minutos, no en horas.
+function analyzeRebote(closes, highs, lows) {
+  const lookback = 20;
+  if (!closes || closes.length < lookback + 20) return null;
+  const rsiSeries = calcRSISeries(closes, 14);
+  const rsiOffset = closes.length - rsiSeries.length; // rsiSeries[i] corresponde a closes[i+rsiOffset]
+  const n = closes.length;
+  const half = Math.floor(lookback / 2);
+  const window = Array.from({ length: lookback }, (_, i) => n - lookback + i);
+  const firstHalf = window.slice(0, half).filter(i => i - rsiOffset >= 0);
+  const secondHalf = window.slice(half).filter(i => i - rsiOffset >= 0);
+  if (firstHalf.length === 0 || secondHalf.length === 0) return null;
+
+  const idxOlderLow = firstHalf.reduce((best, i) => lows[i] < lows[best] ? i : best, firstHalf[0]);
+  const idxRecentLow = secondHalf.reduce((best, i) => lows[i] < lows[best] ? i : best, secondHalf[0]);
+  const idxOlderHigh = firstHalf.reduce((best, i) => highs[i] > highs[best] ? i : best, firstHalf[0]);
+  const idxRecentHigh = secondHalf.reduce((best, i) => highs[i] > highs[best] ? i : best, secondHalf[0]);
+
+  const rsiOlderLow = rsiSeries[idxOlderLow - rsiOffset], rsiRecentLow = rsiSeries[idxRecentLow - rsiOffset];
+  const rsiOlderHigh = rsiSeries[idxOlderHigh - rsiOffset], rsiRecentHigh = rsiSeries[idxRecentHigh - rsiOffset];
+
+  let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
+  if (lows[idxRecentLow] < lows[idxOlderLow] && rsiRecentLow > rsiOlderLow) {
+    signal = 'COMPRAR'; direction = 'LARGO';
+    confidence = Math.round(Math.min(90, 65 + (rsiRecentLow - rsiOlderLow) * 1.5));
+  } else if (highs[idxRecentHigh] > highs[idxOlderHigh] && rsiRecentHigh < rsiOlderHigh) {
+    signal = 'VENDER'; direction = 'SHORT';
+    confidence = Math.round(Math.min(90, 65 + (rsiOlderHigh - rsiRecentHigh) * 1.5));
+  }
+
+  const price = closes[n - 1];
+  const atr = calcATR(highs, lows, closes) || price * 0.01;
+  let entry = price, tp, sl;
+  // Objetivos chicos a propósito — la idea es resolverse rápido, no esperar horas
+  if (signal === 'COMPRAR') { tp = price + atr * 1.2; sl = price - atr * 0.8; }
+  else if (signal === 'VENDER') { tp = price - atr * 1.2; sl = price + atr * 0.8; }
+  else { tp = price + atr; sl = price - atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence, price, entry, tp, sl, rr, strategy: 'Rebote', atr };
+}
+
 function calcMACDSeries(c) {
   const macdLine = [];
   for (let i = 26; i <= c.length; i++) {
@@ -1002,7 +1048,7 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = t.strategy === 'Rango' ? 2 : 48; // el Rango apuesta a un rebote rápido, si no pasó en 2hs el rango ya no es válido
+      const MAX_HOURS_OPEN = t.strategy === 'Rebote' ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Rebote apuesta a un rebote de 15-30 min — si no pasó en media hora, se cierra
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
@@ -1046,6 +1092,14 @@ async function runAutoCheckInner() {
         if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
+    // Rebote opera SIEMPRE en 15m, sin importar qué timeframes estén
+    // configurados para las otras estrategias — es la idea de aprovechar el
+    // vaivén de corto plazo, no depende de mirar 1h/4h.
+    try {
+      const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);
+      const d = analyzeRebote(closes15, highs15, lows15);
+      if (d) signals.push({ tf: '15m', pair, signal: d.signal, confidence: d.confidence, analysis: d });
+    } catch (e) { console.log(`Analyze Rebote error ${pair}:`, e.message); }
     const buys = signals.filter(s => s.signal === 'COMPRAR' && s.confidence >= state.minConfidence);
     const sells = signals.filter(s => s.signal === 'VENDER' && s.confidence >= state.minConfidence);
     const threshold = state.requireMTF ? 2 : 1;

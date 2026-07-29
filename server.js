@@ -100,12 +100,22 @@ async function initMongo() {
     stateCollection = db.collection("bot_state");
     console.log("MongoDB conectado correctamente");
 
+    // Si existe el documento viejo "main" (de antes de separar por modo), lo
+    // usamos como fuente para migrar TANTO la configuración como lo financiero
+    // — la vez pasada me olvidé de migrar la config y reseteó tus umbrales sin avisar.
+    const oldMain = await stateCollection.findOne({ _id: "main" });
+
     // 1) Config compartida
     let config = {};
     const configDoc = await stateCollection.findOne({ _id: "config" });
     if (configDoc) {
       delete configDoc._id;
       for (const f of CONFIG_FIELDS) config[f] = configDoc[f] !== undefined ? configDoc[f] : DEFAULT_STATE[f];
+    } else if (oldMain) {
+      // Primera vez con el esquema nuevo: migramos la config real desde "main", no defaults en blanco.
+      for (const f of CONFIG_FIELDS) config[f] = oldMain[f] !== undefined ? oldMain[f] : DEFAULT_STATE[f];
+      await stateCollection.insertOne({ _id: "config", ...config });
+      console.log("Migración: configuración real copiada desde 'main' (no se resetearon los umbrales)");
     } else {
       for (const f of CONFIG_FIELDS) config[f] = DEFAULT_STATE[f];
       await stateCollection.insertOne({ _id: "config", ...config });
@@ -115,10 +125,8 @@ async function initMongo() {
     const financial = await loadFinancialDoc(config.tradingMode || 'demo');
     state = { ...DEFAULT_STATE, ...config, ...financial };
 
-    // Migración de compatibilidad: si existe el documento viejo "main" (antes de
-    // separar por modo) y todavía no hay nada guardado en "financial_demo",
-    // migramos su capital/trades una sola vez para no perder el historial.
-    const oldMain = await stateCollection.findOne({ _id: "main" });
+    // Migración de compatibilidad: si todavía no hay nada guardado en
+    // "financial_demo", migramos el capital/trades de "main" una sola vez.
     const demoFinancialExists = await stateCollection.findOne({ _id: "financial_demo" });
     if (oldMain && !demoFinancialExists) {
       delete oldMain._id;
@@ -763,7 +771,10 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   if (pnl < 0) state.consecutiveLosses += 1; else state.consecutiveLosses = 0;
   // Enfriamiento por cualquier pérdida (no solo Sub-SL) — evita reabrir la
   // misma apuesta perdedora casi al instante si el capital se libera enseguida.
-  if (pnl < 0) {
+  // OJO: si ya viene de un Sub-SL, ESE bloque ya calculó y guardó el cooldown
+  // escalonado (30→60→120→240 min según la racha) — no lo pisamos acá con
+  // el valor fijo de 30, o se pierde el escalado.
+  if (pnl < 0 && !reason.includes('Sub-SL')) {
     if (!state.pairCooldowns) state.pairCooldowns = {};
     state.pairCooldowns[t.pair + '-' + t.signal] = Date.now() + (state.cooldownMinutes || 30) * 60 * 1000;
   }

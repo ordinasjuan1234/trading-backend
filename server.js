@@ -408,6 +408,51 @@ function analyzeRebote(closes, highs, lows) {
   return { signal, direction, confidence, price, entry, tp, sl, rr, strategy: 'Rebote', atr };
 }
 
+// Estrategia SCALPING: pensada para operar como lo hace Juan a mano — varias
+// veces por hora, 15-30 minutos por operación, no horas. Dispara con un cruce
+// rápido de medias (9/21) en 5m, con RSI confirmando que no está en un extremo
+// agotado. Usa DOS niveles de TP explícitos (no trailing): TP1 cierra la mitad
+// rápido, TP2 se queda con el resto buscando un poco más antes de cerrar del todo.
+function analyzeScalping(closes, highs, lows) {
+  if (!closes || closes.length < 30) return null;
+  const ema9 = calcEMA(closes, 9);
+  const ema21 = calcEMA(closes, 21);
+  const closesPrev = closes.slice(0, -1);
+  const ema9Prev = calcEMA(closesPrev, 9);
+  const ema21Prev = calcEMA(closesPrev, 21);
+  if (!ema9 || !ema21 || !ema9Prev || !ema21Prev) return null;
+
+  const rsiSeries = calcRSISeries(closes, 14);
+  const rsi = rsiSeries[rsiSeries.length - 1];
+  const price = closes[closes.length - 1];
+  const atr = calcATR(highs, lows, closes) || price * 0.005;
+
+  let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
+  const crossUp = ema9Prev <= ema21Prev && ema9 > ema21;
+  const crossDown = ema9Prev >= ema21Prev && ema9 < ema21;
+
+  if (crossUp && rsi < 70) {
+    signal = 'COMPRAR'; direction = 'LARGO';
+    confidence = Math.round(Math.min(85, 60 + (70 - rsi) / 2));
+  } else if (crossDown && rsi > 30) {
+    signal = 'VENDER'; direction = 'SHORT';
+    confidence = Math.round(Math.min(85, 60 + (rsi - 30) / 2));
+  }
+
+  let entry = price, tp1, tp2, sl;
+  // Objetivos chicos a propósito: TP1 rápido y cercano, TP2 un poco más lejos,
+  // SL apretado — todo pensado para resolverse en 15-30 minutos, no en horas.
+  if (signal === 'COMPRAR') {
+    tp1 = price + atr * 0.8; tp2 = price + atr * 1.6; sl = price - atr * 0.6;
+  } else if (signal === 'VENDER') {
+    tp1 = price - atr * 0.8; tp2 = price - atr * 1.6; sl = price + atr * 0.6;
+  } else {
+    tp1 = price + atr; tp2 = price + atr * 2; sl = price - atr;
+  }
+  const rr = Math.abs(tp2 - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence, price, entry, tp: tp1, tp2, sl, rr, strategy: 'Scalping', atr };
+}
+
 function calcMACDSeries(c) {
   const macdLine = [];
   for (let i = 26; i <= c.length; i++) {
@@ -702,6 +747,7 @@ async function openTrade(pair, tf, analysis) {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: realEntry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     strategy: analysis.strategy || 'Reversión',
+    tp2: analysis.tp2 || null, // solo Scalping usa un segundo nivel de TP
     // Guardamos el ATR EFECTIVO (la distancia real usada para el SL, ya con el
     // ajuste de volatilidad del día aplicado) — no el ATR crudo — para que el
     // trailing stop se active de forma consistente con el TP/SL real de esta operación.
@@ -1048,14 +1094,29 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = t.strategy === 'Rebote' ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Rebote apuesta a un rebote de 15-30 min — si no pasó en media hora, se cierra
+      const MAX_HOURS_OPEN = (t.strategy === 'Rebote' || t.strategy === 'Scalping') ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Rebote y Scalping apuestan a 15-30 min — si no pasó, se cierra
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
       // TP/SL ahora se detectan por mecha (high/low), pero el cierre se registra
       // al precio EXACTO del TP/SL (así como llenaría una orden real), no al
       // precio de cierre de la vela, que puede ser distinto.
-      if (t.signal === 'COMPRAR' && recentHigh >= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
+      if (t.strategy === 'Scalping' && t.tp2 && !t.partialTaken) {
+        // Scalping usa 2 TPs explícitos: al tocar el primero, asegura la mitad
+        // y mueve el objetivo del resto al segundo TP (más lejos).
+        const hitTP1 = (t.signal === 'COMPRAR' && recentHigh >= t.tp) || (t.signal === 'VENDER' && recentLow <= t.tp);
+        const hitSL = (t.signal === 'COMPRAR' && recentLow <= t.sl) || (t.signal === 'VENDER' && recentHigh >= t.sl);
+        if (hitTP1) {
+          await partialCloseTrade(t, t.tp);
+          t.tp = t.tp2;
+          t.tp2 = null;
+          await saveState(state);
+        } else if (hitSL) {
+          await closeTradeById(t.id, t.sl, 'SL Auto');
+        } else if (hoursOpen >= MAX_HOURS_OPEN) {
+          await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
+        }
+      } else if (t.signal === 'COMPRAR' && recentHigh >= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
       else if (t.signal === 'COMPRAR' && recentLow <= t.sl) await closeTradeById(t.id, t.sl, 'SL Auto');
       else if (t.signal === 'VENDER' && recentLow <= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
       else if (t.signal === 'VENDER' && recentHigh >= t.sl) await closeTradeById(t.id, t.sl, 'SL Auto');
@@ -1105,8 +1166,23 @@ async function runAutoCheckInner() {
       const d = analyzeRebote(closes15, highs15, lows15);
       if (d) signals.push({ tf: '15m', pair, signal: d.signal, confidence: d.confidence, analysis: d });
     } catch (e) { console.log(`Analyze Rebote error ${pair}:`, e.message); }
-    const buys = signals.filter(s => s.signal === 'COMPRAR' && s.confidence >= state.minConfidence);
-    const sells = signals.filter(s => s.signal === 'VENDER' && s.confidence >= state.minConfidence);
+
+    // Scalping opera SIEMPRE en 5m — pensada para operar varias veces por
+    // hora, 15-30 minutos por operación, con 2 niveles de TP.
+    try {
+      const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
+      const e = analyzeScalping(closes5, highs5, lows5);
+      if (e) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
+    } catch (e) { console.log(`Analyze Scalping error ${pair}:`, e.message); }
+    // Rebote y Scalping usan su PROPIO umbral de confianza (más bajo a propósito)
+    // en vez del global — son estrategias distintas, pensadas para operar seguido
+    // con objetivos chicos, no tiene sentido exigirles la misma convicción que a Tendencia.
+    const passesConfidence = (s) => {
+      if (s.analysis.strategy === 'Rebote' || s.analysis.strategy === 'Scalping') return s.confidence >= 60;
+      return s.confidence >= state.minConfidence;
+    };
+    const buys = signals.filter(s => s.signal === 'COMPRAR' && passesConfidence(s));
+    const sells = signals.filter(s => s.signal === 'VENDER' && passesConfidence(s));
     const threshold = state.requireMTF ? 2 : 1;
     // Antes esto era if/else if, lo que hacía que COMPRAR siempre le ganara a VENDER
     // por defecto cuando había señales de ambos lados al mismo tiempo (con 2 estrategias

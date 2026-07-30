@@ -1023,21 +1023,15 @@ async function runAutoCheck() {
 }
 
 async function runAutoCheckInner() {
-  if (!state.autoMode) return;
+  // OJO: el chequeo de autoMode/límites diarios se movió más abajo, justo
+  // antes de buscar señales NUEVAS — así, aunque el bot esté pausado (por
+  // 3 pérdidas seguidas, o por un límite diario), las operaciones que ya
+  // están abiertas SIGUEN vigiladas (TP/SL/Sub-SL) y protegidas, en vez de
+  // quedar sueltas sin control hasta que alguien reactive el AUTO a mano.
   const today = new Date().toDateString();
   if (state.lastResetDate !== today) {
     state.dailyPnl = 0; state.dailyTrades = 0; state.lastResetDate = today;
     await saveState(state);
-  }
-  const maxGain = state.capital * state.maxDailyGainPct / 100;
-  const maxLoss = state.capital * state.maxDailyLossPct / 100;
-  if (state.dailyPnl >= maxGain) {
-    sendTelegram(`✅ Límite de ganancia diaria alcanzado ($${state.dailyPnl.toFixed(2)})`);
-    state.autoMode = false; await saveState(state); return;
-  }
-  if (state.dailyPnl <= -maxLoss) {
-    sendTelegram(`🛑 Límite de pérdida diaria alcanzado ($${state.dailyPnl.toFixed(2)})`);
-    state.autoMode = false; await saveState(state); return;
   }
 
   // Check each open trade individually (multi-posición: una por par)
@@ -1183,11 +1177,21 @@ async function runAutoCheckInner() {
     } catch (e) { console.log('Check open trade error:', e.message); }
   }
 
-  // Nota: si el bot está pausado (autoMode false), esta función ni siquiera
-  // llega hasta acá — el seguimiento fantasma también queda en pausa, igual
-  // que el monitoreo de operaciones abiertas (limitación ya conocida).
+  // La vigilancia de operaciones abiertas y el seguimiento fantasma YA
+  // corrieron arriba, sin importar el estado del AUTO — lo único que se
+  // frena acá es la búsqueda de operaciones NUEVAS.
   await checkGhostTrades();
   if (!state.autoMode) return;
+  const maxGain = state.capital * state.maxDailyGainPct / 100;
+  const maxLoss = state.capital * state.maxDailyLossPct / 100;
+  if (state.dailyPnl >= maxGain) {
+    sendTelegram(`✅ Límite de ganancia diaria alcanzado ($${state.dailyPnl.toFixed(2)}) — no se abren operaciones nuevas, pero las que ya están abiertas siguen vigiladas.`);
+    state.autoMode = false; await saveState(state); return;
+  }
+  if (state.dailyPnl <= -maxLoss) {
+    sendTelegram(`🛑 Límite de pérdida diaria alcanzado ($${state.dailyPnl.toFixed(2)}) — no se abren operaciones nuevas, pero las que ya están abiertas siguen vigiladas.`);
+    state.autoMode = false; await saveState(state); return;
+  }
 
   // Look for new signal only on pairs that don't already have an open trade
   const openPairs = new Set(state.openTrades.map(t => t.pair));

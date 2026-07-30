@@ -1297,6 +1297,30 @@ app.get("/", (req, res) => {
   res.json({ status: "Signal Bot Backend OK", time: new Date().toISOString(), autoMode: state.autoMode });
 });
 
+app.get("/debug/signals", async (req, res) => {
+  const pair = req.query.pair || 'ETHUSDT';
+  try {
+    const results = [];
+    for (const tf of ['1h', '4h']) {
+      const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
+      const a = analyzeImproved(closes, highs, lows);
+      if (a) results.push({ tf, strategy: 'Reversión', signal: a.signal, confidence: a.confidence });
+      const b = analyzeTrendFollow(closes, highs, lows);
+      if (b) results.push({ tf, strategy: 'Tendencia', signal: b.signal, confidence: b.confidence });
+    }
+    const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);
+    const d = analyzeRebote(closes15, highs15, lows15);
+    if (d) results.push({ tf: '15m', strategy: 'Rebote', signal: d.signal, confidence: d.confidence });
+    const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
+    const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
+    const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1);
+    if (e) results.push({ tf: '5m', strategy: 'Scalping', signal: e.signal, confidence: e.confidence, regimen: e.regime });
+    res.json({ success: true, pair, minConfidence: state.minConfidence, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/stats/scalping-breakdown", (req, res) => {
   const scalpingTrades = state.trades.filter(t => t.strategy === 'Scalping' && t.subStrategy);
   const bySubStrat = {};

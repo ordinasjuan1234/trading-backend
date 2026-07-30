@@ -502,6 +502,27 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
   return { signal, direction, confidence, price, entry, tp: tp1, tp2, sl, rr, strategy: 'Scalping', atr, regime: regimeLabel };
 }
 
+// PRIMERA VERSIÓN (básica) de entrada multi-timeframe para Tendencia: antes
+// de dejarla entrar, chequea en 15m si el precio ya se alejó mucho de su
+// propio promedio de corto plazo — si está muy estirado, es señal de que el
+// movimiento de 4h ya viene "cansado" en el corto plazo, y probablemente
+// estemos llegando tarde. Se puede afinar más adelante (esperar un
+// retroceso + vela de rebote a favor), esto es el primer paso.
+async function checkGoodEntry15m(pair, direction) {
+  try {
+    const { closes: closes15 } = await fetchKlines(pair, '15m', 30);
+    const ema9_15 = calcEMA(closes15, 9);
+    const price15 = closes15[closes15.length - 1];
+    if (!ema9_15) return true; // sin datos suficientes, no bloqueamos por las dudas
+    const distPct = (price15 - ema9_15) / ema9_15;
+    // Si es COMPRAR, no queremos que el precio ya esté muy por ENCIMA de su
+    // promedio corto (comprando caro); si es VENDER, no muy por DEBAJO.
+    if (direction === 'LARGO') return distPct < 0.004;
+    if (direction === 'SHORT') return distPct > -0.004;
+    return true;
+  } catch (e) { return true; } // si falla la consulta, no bloqueamos la señal por eso
+}
+
 function calcMACDSeries(c) {
   const macdLine = [];
   for (let i = 26; i <= c.length; i++) {
@@ -1208,7 +1229,16 @@ async function runAutoCheckInner() {
         const a = analyzeImproved(closes, highs, lows);
         if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
         const b = analyzeTrendFollow(closes, highs, lows);
-        if (b) signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        if (b && b.signal !== 'NEUTRO') {
+          const goodEntry = await checkGoodEntry15m(pair, b.direction);
+          if (goodEntry) {
+            signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+          } else {
+            console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
+          }
+        } else if (b) {
+          signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        }
         // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
         // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
         // alcanza para detectar un rango operable de verdad. Queda el código

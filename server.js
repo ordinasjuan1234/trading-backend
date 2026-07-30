@@ -413,45 +413,83 @@ function analyzeRebote(closes, highs, lows) {
 // rápido de medias (9/21) en 5m, con RSI confirmando que no está en un extremo
 // agotado. Usa DOS niveles de TP explícitos (no trailing): TP1 cierra la mitad
 // rápido, TP2 se queda con el resto buscando un poco más antes de cerrar del todo.
-function analyzeScalping(closes, highs, lows) {
-  if (!closes || closes.length < 31) return null;
-  const ema9 = calcEMA(closes, 9);
-  const ema21 = calcEMA(closes, 21);
-  const closesPrev = closes.slice(0, -1);
-  const ema9Prev = calcEMA(closesPrev, 9);
-  const ema21Prev = calcEMA(closesPrev, 21);
-  // Confirmación de 2 velas: exigimos que HACE una vela YA estuviera cruzado
-  // en la misma dirección, así no entramos justo en el pico más picado del
-  // serrucho — si el cruce se sostiene, es más probable que sea un giro real.
-  const closesPrev2 = closes.slice(0, -2);
-  const ema9Prev2 = calcEMA(closesPrev2, 9);
-  const ema21Prev2 = calcEMA(closesPrev2, 21);
-  if (!ema9 || !ema21 || !ema9Prev || !ema21Prev || !ema9Prev2 || !ema21Prev2) return null;
+// Lee la "estructura" real del precio en 1m para decidir si el momento actual
+// tiene tendencia clara (aunque venga en serrucho) o es genuinamente lateral —
+// usando 3 factores: pendiente general, fuerza del cuerpo de las velas
+// (cuerpo grande = convicción, muchos dojis = indecisión), y si el volumen
+// reciente confirma que hay "combustible" real detrás del movimiento.
+function detectMicroRegime(opens, highs, lows, closes, volumes) {
+  const n = closes.length;
+  const lookback = Math.min(20, n - 1);
+  if (lookback < 10) return { isTrending: false, direction: 'lateral' };
+  const adx = calcADX(highs, lows, closes, 14);
 
-  const rsiSeries = calcRSISeries(closes, 14);
-  const rsi = rsiSeries[rsiSeries.length - 1];
+  let bodySum = 0, rangeSum = 0;
+  for (let i = n - lookback; i < n; i++) {
+    bodySum += Math.abs(closes[i] - opens[i]);
+    rangeSum += (highs[i] - lows[i]) || 0.00001;
+  }
+  const bodyRatio = bodySum / rangeSum; // 0 a 1 — más alto = velas con cuerpo fuerte, no dojis
+
+  const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+  const baseVol = volumes.slice(-lookback, -5).reduce((a, b) => a + b, 0) / Math.max(1, lookback - 5);
+  const volConfirms = recentVol > baseVol * 1.05;
+
+  const slopePct = (closes[n - 1] - closes[n - lookback]) / closes[n - lookback];
+  const isTrending = adx !== null && adx >= 20 && bodyRatio >= 0.45 && volConfirms;
+  return { isTrending, adx, bodyRatio, volConfirms, slopePct, direction: slopePct >= 0 ? 'up' : 'down' };
+}
+
+function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m, volumes1m) {
+  if (!closes || closes.length < 31) return null;
   const price = closes[closes.length - 1];
   const atr = calcATR(highs, lows, closes) || price * 0.005;
+  const regime = (opens1m && closes1m) ? detectMicroRegime(opens1m, highs1m, lows1m, closes1m, volumes1m) : { isTrending: false, direction: 'lateral' };
 
   let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
-  // Confirmación de 2 velas: el cruce tiene que haber pasado HACE una vela y
-  // seguir sostenido ahora — no agarramos el cruce en el instante exacto en
-  // que ocurre (eso era lo que nos hacía entrar justo en el pico del serrucho).
-  const crossUp = ema9 > ema21 && ema9Prev > ema21Prev && ema9Prev2 <= ema21Prev2;
-  const crossDown = ema9 < ema21 && ema9Prev < ema21Prev && ema9Prev2 >= ema21Prev2;
 
-  if (crossUp && rsi < 70) {
-    signal = 'COMPRAR'; direction = 'LARGO';
-    confidence = Math.round(Math.min(85, 60 + (70 - rsi) / 2));
-  } else if (crossDown && rsi > 30) {
-    signal = 'VENDER'; direction = 'SHORT';
-    confidence = Math.round(Math.min(85, 60 + (rsi - 30) / 2));
+  if (regime.isTrending) {
+    // Hay tendencia clara en el corto plazo (aunque sea en serrucho) — la
+    // seguimos con el cruce de medias, no peleamos contra ella.
+    const ema9 = calcEMA(closes, 9), ema21 = calcEMA(closes, 21);
+    const closesPrev = closes.slice(0, -1);
+    const ema9Prev = calcEMA(closesPrev, 9), ema21Prev = calcEMA(closesPrev, 21);
+    const closesPrev2 = closes.slice(0, -2);
+    const ema9Prev2 = calcEMA(closesPrev2, 9), ema21Prev2 = calcEMA(closesPrev2, 21);
+    if (ema9 && ema21 && ema9Prev && ema21Prev && ema9Prev2 && ema21Prev2) {
+      const rsiSeries = calcRSISeries(closes, 14);
+      const rsi = rsiSeries[rsiSeries.length - 1];
+      const crossUp = ema9 > ema21 && ema9Prev > ema21Prev && ema9Prev2 <= ema21Prev2;
+      const crossDown = ema9 < ema21 && ema9Prev < ema21Prev && ema9Prev2 >= ema21Prev2;
+      if (crossUp && rsi < 70 && regime.direction === 'up') {
+        signal = 'COMPRAR'; direction = 'LARGO';
+        confidence = Math.round(Math.min(88, 65 + (70 - rsi) / 2));
+      } else if (crossDown && rsi > 30 && regime.direction === 'down') {
+        signal = 'VENDER'; direction = 'SHORT';
+        confidence = Math.round(Math.min(88, 65 + (rsi - 30) / 2));
+      }
+    }
+  } else {
+    // Genuinamente lateral: comprar cerca del piso del rango reciente (30 min
+    // ≈ últimas 6 velas de 5m), vender cerca del techo — y viceversa.
+    const rangeLookback = Math.min(6, highs.length);
+    const recentHighs = highs.slice(-rangeLookback);
+    const recentLows = lows.slice(-rangeLookback);
+    const rangeTop = Math.max(...recentHighs);
+    const rangeBottom = Math.min(...recentLows);
+    const rangeSize = rangeTop - rangeBottom || price * 0.001;
+    const posInRange = (price - rangeBottom) / rangeSize; // 0 = piso, 1 = techo
+    if (posInRange <= 0.25) {
+      signal = 'COMPRAR'; direction = 'LARGO';
+      confidence = Math.round(70 + (0.25 - posInRange) * 40);
+    } else if (posInRange >= 0.75) {
+      signal = 'VENDER'; direction = 'SHORT';
+      confidence = Math.round(70 + (posInRange - 0.75) * 40);
+    }
   }
 
   let entry = price, tp1, tp2, sl;
   // Objetivos pensados para 15-30 minutos: TP1 cerca, TP2 un poco más lejos.
-  // SL ensanchado a 1x ATR (antes 0.6x) — el más ajustado cortaba por ruido
-  // normal de 5m antes de darle tiempo real a la operación de desarrollarse.
   if (signal === 'COMPRAR') {
     tp1 = price + atr * 0.8; tp2 = price + atr * 1.6; sl = price - atr * 1.0;
   } else if (signal === 'VENDER') {
@@ -460,7 +498,8 @@ function analyzeScalping(closes, highs, lows) {
     tp1 = price + atr; tp2 = price + atr * 2; sl = price - atr;
   }
   const rr = Math.abs(tp2 - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence, price, entry, tp: tp1, tp2, sl, rr, strategy: 'Scalping', atr };
+  const regimeLabel = regime.isTrending ? `Tendencia ${regime.direction}` : 'Lateral';
+  return { signal, direction, confidence, price, entry, tp: tp1, tp2, sl, rr, strategy: 'Scalping', atr, regime: regimeLabel };
 }
 
 function calcMACDSeries(c) {
@@ -688,6 +727,7 @@ async function fetchKlines(pair, tf, limit = 100) {
   if (!res.ok) throw new Error('Par no encontrado');
   const data = await res.json();
   return {
+    opens: data.map(k => parseFloat(k[1])),
     closes: data.map(k => parseFloat(k[4])),
     highs: data.map(k => parseFloat(k[2])),
     lows: data.map(k => parseFloat(k[3])),
@@ -757,6 +797,11 @@ async function openTrade(pair, tf, analysis) {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: realEntry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
     strategy: analysis.strategy || 'Reversión',
+    // Mi aporte: si es Scalping, guardamos también CUÁL de las dos ramas
+    // internas la abrió (siguiendo tendencia o apostando al rebote lateral) —
+    // sin esto, "Scalping" sería una sola bolsa y nunca sabríamos cuál de
+    // las dos mitades funciona de verdad, solo el promedio de las dos.
+    subStrategy: analysis.regime ? `Scalping-${analysis.regime.startsWith('Tendencia') ? 'Tendencia' : 'Lateral'}` : null,
     tp2: analysis.tp2 || null, // solo Scalping usa un segundo nivel de TP
     // Guardamos el ATR EFECTIVO (la distancia real usada para el SL, ya con el
     // ajuste de volatilidad del día aplicado) — no el ATR crudo — para que el
@@ -776,7 +821,8 @@ async function openTrade(pair, tf, analysis) {
   const cloudInfo = analysis.cloud ? `\n☁️ ${analysis.signal==='COMPRAR' ? 'Por encima de la nube (ruptura confirmada)' : 'Por debajo de la nube (ruptura confirmada)'}` : '';
   const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
   const adxInfo = (analysis.adx !== undefined && analysis.adx !== null) ? `\n📐 ADX: ${analysis.adx.toFixed(1)} (${analysis.adx >= 20 ? 'tendencia confirmada' : 'mercado lateral'})` : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  const regimeInfo = analysis.regime ? `\n🔎 Régimen (1m): ${analysis.regime}` : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}${regimeInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 // Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,
@@ -1178,10 +1224,12 @@ async function runAutoCheckInner() {
     } catch (e) { console.log(`Analyze Rebote error ${pair}:`, e.message); }
 
     // Scalping opera SIEMPRE en 5m — pensada para operar varias veces por
-    // hora, 15-30 minutos por operación, con 2 niveles de TP.
+    // hora, 15-30 minutos por operación, con 2 niveles de TP. Además mira 1m
+    // para diagnosticar si el momento actual tiene tendencia real o es lateral.
     try {
       const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
-      const e = analyzeScalping(closes5, highs5, lows5);
+      const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
+      const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1);
       if (e) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
     } catch (e) { console.log(`Analyze Scalping error ${pair}:`, e.message); }
     // Rebote y Scalping usan su PROPIO umbral de confianza (más bajo a propósito)
@@ -1247,6 +1295,22 @@ async function runAutoCheckInner() {
 // ── Routes ────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "Signal Bot Backend OK", time: new Date().toISOString(), autoMode: state.autoMode });
+});
+
+app.get("/stats/scalping-breakdown", (req, res) => {
+  const scalpingTrades = state.trades.filter(t => t.strategy === 'Scalping' && t.subStrategy);
+  const bySubStrat = {};
+  for (const t of scalpingTrades) {
+    if (!bySubStrat[t.subStrategy]) bySubStrat[t.subStrategy] = { total: 0, wins: 0, pnl: 0 };
+    bySubStrat[t.subStrategy].total += 1;
+    bySubStrat[t.subStrategy].pnl += t.pnl;
+    if (t.pnl >= 0) bySubStrat[t.subStrategy].wins += 1;
+  }
+  for (const k in bySubStrat) {
+    bySubStrat[k].winRate = Math.round((bySubStrat[k].wins / bySubStrat[k].total) * 1000) / 10;
+    bySubStrat[k].pnl = Math.round(bySubStrat[k].pnl * 100) / 100;
+  }
+  res.json({ success: true, breakdown: bySubStrat });
 });
 
 app.get("/stats/all-modes", async (req, res) => {

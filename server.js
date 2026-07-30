@@ -1088,8 +1088,13 @@ async function runAutoCheckInner() {
         if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
         const b = analyzeTrendFollow(closes, highs, lows);
         if (b) signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-        const c = analyzeRango(closes, highs, lows);
-        if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
+        // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
+        // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
+        // alcanza para detectar un rango operable de verdad. Queda el código
+        // intacto para cuando se rediseñe (agregar confirmación de que el precio
+        // realmente viene rebotando entre piso y techo, no solo ADX bajo).
+        // const c = analyzeRango(closes, highs, lows);
+        // if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
     // Rebote opera SIEMPRE en 15m, sin importar qué timeframes estén

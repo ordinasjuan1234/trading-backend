@@ -414,13 +414,19 @@ function analyzeRebote(closes, highs, lows) {
 // agotado. Usa DOS niveles de TP explícitos (no trailing): TP1 cierra la mitad
 // rápido, TP2 se queda con el resto buscando un poco más antes de cerrar del todo.
 function analyzeScalping(closes, highs, lows) {
-  if (!closes || closes.length < 30) return null;
+  if (!closes || closes.length < 31) return null;
   const ema9 = calcEMA(closes, 9);
   const ema21 = calcEMA(closes, 21);
   const closesPrev = closes.slice(0, -1);
   const ema9Prev = calcEMA(closesPrev, 9);
   const ema21Prev = calcEMA(closesPrev, 21);
-  if (!ema9 || !ema21 || !ema9Prev || !ema21Prev) return null;
+  // Confirmación de 2 velas: exigimos que HACE una vela YA estuviera cruzado
+  // en la misma dirección, así no entramos justo en el pico más picado del
+  // serrucho — si el cruce se sostiene, es más probable que sea un giro real.
+  const closesPrev2 = closes.slice(0, -2);
+  const ema9Prev2 = calcEMA(closesPrev2, 9);
+  const ema21Prev2 = calcEMA(closesPrev2, 21);
+  if (!ema9 || !ema21 || !ema9Prev || !ema21Prev || !ema9Prev2 || !ema21Prev2) return null;
 
   const rsiSeries = calcRSISeries(closes, 14);
   const rsi = rsiSeries[rsiSeries.length - 1];
@@ -428,8 +434,11 @@ function analyzeScalping(closes, highs, lows) {
   const atr = calcATR(highs, lows, closes) || price * 0.005;
 
   let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
-  const crossUp = ema9Prev <= ema21Prev && ema9 > ema21;
-  const crossDown = ema9Prev >= ema21Prev && ema9 < ema21;
+  // Confirmación de 2 velas: el cruce tiene que haber pasado HACE una vela y
+  // seguir sostenido ahora — no agarramos el cruce en el instante exacto en
+  // que ocurre (eso era lo que nos hacía entrar justo en el pico del serrucho).
+  const crossUp = ema9 > ema21 && ema9Prev > ema21Prev && ema9Prev2 <= ema21Prev2;
+  const crossDown = ema9 < ema21 && ema9Prev < ema21Prev && ema9Prev2 >= ema21Prev2;
 
   if (crossUp && rsi < 70) {
     signal = 'COMPRAR'; direction = 'LARGO';
@@ -440,12 +449,13 @@ function analyzeScalping(closes, highs, lows) {
   }
 
   let entry = price, tp1, tp2, sl;
-  // Objetivos chicos a propósito: TP1 rápido y cercano, TP2 un poco más lejos,
-  // SL apretado — todo pensado para resolverse en 15-30 minutos, no en horas.
+  // Objetivos pensados para 15-30 minutos: TP1 cerca, TP2 un poco más lejos.
+  // SL ensanchado a 1x ATR (antes 0.6x) — el más ajustado cortaba por ruido
+  // normal de 5m antes de darle tiempo real a la operación de desarrollarse.
   if (signal === 'COMPRAR') {
-    tp1 = price + atr * 0.8; tp2 = price + atr * 1.6; sl = price - atr * 0.6;
+    tp1 = price + atr * 0.8; tp2 = price + atr * 1.6; sl = price - atr * 1.0;
   } else if (signal === 'VENDER') {
-    tp1 = price - atr * 0.8; tp2 = price - atr * 1.6; sl = price + atr * 0.6;
+    tp1 = price - atr * 0.8; tp2 = price - atr * 1.6; sl = price + atr * 1.0;
   } else {
     tp1 = price + atr; tp2 = price + atr * 2; sl = price - atr;
   }
@@ -1094,7 +1104,7 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = (t.strategy === 'Rebote' || t.strategy === 'Scalping') ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Rebote y Scalping apuestan a 15-30 min — si no pasó, se cierra
+      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Scalping y Rebote apuntan a 15-30 min — necesitan margen real para que el precio se mueva con volumen
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 

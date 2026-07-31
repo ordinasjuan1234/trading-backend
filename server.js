@@ -1226,19 +1226,25 @@ async function runAutoCheckInner() {
       try {
         // Improved strategy needs more history (210 candles) for SMA200 trend filter
         const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
-        const a = analyzeImproved(closes, highs, lows);
-        if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        const b = analyzeTrendFollow(closes, highs, lows);
-        if (b && b.signal !== 'NEUTRO') {
-          const goodEntry = await checkGoodEntry15m(pair, b.direction);
-          if (goodEntry) {
-            signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-          } else {
-            console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
-          }
-        } else if (b) {
-          signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-        }
+        // Reversión y Tendencia PAUSADAS desde el 30/7 a pedido de Juan — están
+        // diseñadas para moverse en horas (hasta 48hs), no en los 15-30 min que
+        // busca ahora. Forzarlas a un límite corto las haría cerrar casi siempre
+        // por tiempo, no por TP, porque el objetivo fue calculado para un
+        // recorrido mucho más largo. El bot queda operando solo con Scalping y
+        // Rebote, armadas desde cero para esa disciplina de tiempo corto.
+        // const a = analyzeImproved(closes, highs, lows);
+        // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
+        // const b = analyzeTrendFollow(closes, highs, lows);
+        // if (b && b.signal !== 'NEUTRO') {
+        //   const goodEntry = await checkGoodEntry15m(pair, b.direction);
+        //   if (goodEntry) {
+        //     signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        //   } else {
+        //     console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
+        //   }
+        // } else if (b) {
+        //   signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        // }
         // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
         // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
         // alcanza para detectar un rango operable de verdad. Queda el código

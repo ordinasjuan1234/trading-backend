@@ -492,12 +492,16 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
     const rangeBottom = Math.min(...recentLows);
     const rangeSize = rangeTop - rangeBottom || price * 0.001;
     const posInRange = (price - rangeBottom) / rangeSize; // 0 = piso, 1 = techo
-    if (posInRange <= 0.25) {
+    // Umbral más exigente (31/7, a pedido de Juan) — antes entraba con solo
+    // acercarse al 25%/75% del rango, generando entradas de baja convicción
+    // que terminaban cortándose "por las dudas" y pagando comisión igual.
+    // Ahora exige estar genuinamente cerca del extremo (15%/85%).
+    if (posInRange <= 0.15) {
       signal = 'COMPRAR'; direction = 'LARGO';
-      confidence = Math.round(70 + (0.25 - posInRange) * 40);
-    } else if (posInRange >= 0.75) {
+      confidence = Math.round(75 + (0.15 - posInRange) * 60);
+    } else if (posInRange >= 0.85) {
       signal = 'VENDER'; direction = 'SHORT';
-      confidence = Math.round(70 + (posInRange - 0.75) * 40);
+      confidence = Math.round(75 + (posInRange - 0.85) * 60);
     }
     // El objetivo en lateral es el LADO OPUESTO del rango real (no un ATR
     // genérico) — comprás en el piso, apuntás al techo, y viceversa. El SL
@@ -1324,6 +1328,9 @@ async function runAutoCheckInner() {
     // en vez del global — son estrategias distintas, pensadas para operar seguido
     // con objetivos chicos, no tiene sentido exigirles la misma convicción que a Tendencia.
     const passesConfidence = (s) => {
+      // Lateral necesita más convicción — era la rama con peor resultado (0%
+      // de aciertos en 16 operaciones), muchas entradas de baja convicción.
+      if (s.analysis.strategy === 'Scalping' && s.analysis.regime === 'Lateral') return s.confidence >= 78;
       if (s.analysis.strategy === 'Rebote' || s.analysis.strategy === 'Scalping') return s.confidence >= 60;
       return s.confidence >= state.minConfidence;
     };

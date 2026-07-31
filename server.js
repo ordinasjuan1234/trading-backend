@@ -453,10 +453,16 @@ function detectMicroRegime(opens, highs, lows, closes, volumes) {
   return { isTrending, adx, bodyRatio, volConfirms, isDecelerating, slopePct, direction: slopePct >= 0 ? 'up' : 'down' };
 }
 
-function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m, volumes1m) {
+function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m, volumes1m, highs15, lows15, closes15) {
   if (!closes || closes.length < 31) return null;
   const price = closes[closes.length - 1];
-  const atr = calcATR(highs, lows, closes) || price * 0.005;
+  // El ATR de 5m es chico por naturaleza — usarlo para el objetivo hacía que
+  // la operación se resolviera en minutos, no en los 15-30 min que buscamos.
+  // 5m/1m siguen usándose para LEER hacia dónde va el mercado (la entrada),
+  // pero el TAMAÑO del objetivo ahora se calcula con la volatilidad real de
+  // 15m — mucho más representativa de un movimiento de media hora.
+  const atr15 = (highs15 && lows15 && closes15) ? calcATR(highs15, lows15, closes15) : null;
+  const atr = atr15 || calcATR(highs, lows, closes) || price * 0.005;
   const regime = (opens1m && closes1m) ? detectMicroRegime(opens1m, highs1m, lows1m, closes1m, volumes1m) : { isTrending: false, direction: 'lateral' };
 
   let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
@@ -1228,14 +1234,45 @@ async function runAutoCheckInner() {
         // Scalping usa 2 TPs explícitos: al tocar el primero, asegura la mitad
         // y mueve el objetivo del resto al segundo TP (más lejos).
         const hitTP1 = (t.signal === 'COMPRAR' && recentHigh >= t.tp) || (t.signal === 'VENDER' && recentLow <= t.tp);
-        const hitSL = (t.signal === 'COMPRAR' && recentLow <= t.sl) || (t.signal === 'VENDER' && recentHigh >= t.sl);
+        // Lateral tiene más paciencia en el SL (31/7, a pedido de Juan): si
+        // entró mal, esperamos a que el precio se ASIENTE más allá del límite
+        // (usando el cierre de la vela), no que cierre apenas la MECHA lo toca
+        // por un instante — así le damos margen real a que se revierta, en
+        // vez de saltar a la primera sacudida.
+        const hitSL = t.subStrategy === 'Scalping-Lateral'
+          ? ((t.signal === 'COMPRAR' && currentPrice <= t.sl) || (t.signal === 'VENDER' && currentPrice >= t.sl))
+          : ((t.signal === 'COMPRAR' && recentLow <= t.sl) || (t.signal === 'VENDER' && recentHigh >= t.sl));
         if (hitTP1) {
           await partialCloseTrade(t, t.tp);
           t.tp = t.tp2;
           t.tp2 = null;
           await saveState(state);
         } else if (hitSL) {
-          await closeTradeById(t.id, t.sl, 'SL Auto');
+          // Antes de rendirse, damos UNA sola extensión de paciencia (31/7, a
+          // pedido de Juan): si el detector de 1m todavía muestra que la
+          // dirección original sigue en pie (no se dio vuelta de verdad), le
+          // damos más margen en vez de cortar apenas toca el límite. Si ya se
+          // usó la extensión, o la tendencia genuinamente se invirtió, cortamos.
+          if (!t.slExtended) {
+            try {
+              const { opens: opensCheck, highs: highsCheck, lows: lowsCheck, closes: closesCheck, volumes: volumesCheck } = await fetchKlines(t.pair, '1m', 30);
+              const checkRegime = detectMicroRegime(opensCheck, highsCheck, lowsCheck, closesCheck, volumesCheck);
+              const stillFavorsLong = t.signal === 'COMPRAR' && (checkRegime.direction === 'up' && !checkRegime.isDecelerating);
+              const stillFavorsShort = t.signal === 'VENDER' && (checkRegime.direction === 'down' && !checkRegime.isDecelerating);
+              if (stillFavorsLong || stillFavorsShort) {
+                t.slExtended = true;
+                t.sl = t.signal === 'COMPRAR' ? t.sl - t.atr * 0.7 : t.sl + t.atr * 0.7;
+                await saveState(state);
+                console.log(`${t.pair} SL extendido una vez — la dirección original todavía sostiene`);
+              } else {
+                await closeTradeById(t.id, currentPrice, 'SL Auto');
+              }
+            } catch (e) {
+              await closeTradeById(t.id, currentPrice, 'SL Auto'); // si falla el chequeo, cortamos por las dudas
+            }
+          } else {
+            await closeTradeById(t.id, currentPrice, 'SL Auto (tras extensión)');
+          }
         } else if (hoursOpen >= MAX_HOURS_OPEN) {
           await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
         }
@@ -1321,7 +1358,8 @@ async function runAutoCheckInner() {
     try {
       const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
       const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
-      const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1);
+      const { highs: highs15sc, lows: lows15sc, closes: closes15sc } = await fetchKlines(pair, '15m', 30);
+      const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1, highs15sc, lows15sc, closes15sc);
       if (e) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
     } catch (e) { console.log(`Analyze Scalping error ${pair}:`, e.message); }
     // Rebote y Scalping usan su PROPIO umbral de confianza (más bajo a propósito)
@@ -1408,7 +1446,7 @@ app.get("/debug/signals", async (req, res) => {
     if (d) results.push({ tf: '15m', strategy: 'Rebote', signal: d.signal, confidence: d.confidence });
     const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
     const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
-    const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1);
+    const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1, highs15, lows15, closes15);
     if (e) results.push({ tf: '5m', strategy: 'Scalping', signal: e.signal, confidence: e.confidence, regimen: e.regime });
     res.json({ success: true, pair, minConfidence: state.minConfidence, results });
   } catch (err) {

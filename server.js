@@ -1203,7 +1203,7 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.75 : (t.strategy === 'Rango' ? 2 : 48); // 45 min — con objetivos más grandes (30/7), necesitan más margen de tiempo para alcanzarlos
+      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.75 : (t.strategy === 'Rango' ? 2 : (t.strategy === 'Tendencia' ? 2 : 48)); // Tendencia ahora en 30m con límite de 2hs (antes 48hs, llegaba a tardar un día entero)
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
@@ -1315,25 +1315,21 @@ async function runAutoCheckInner() {
       try {
         // Improved strategy needs more history (210 candles) for SMA200 trend filter
         const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
-        // Reversión y Tendencia PAUSADAS desde el 30/7 a pedido de Juan — están
-        // diseñadas para moverse en horas (hasta 48hs), no en los 15-30 min que
-        // busca ahora. Forzarlas a un límite corto las haría cerrar casi siempre
-        // por tiempo, no por TP, porque el objetivo fue calculado para un
-        // recorrido mucho más largo. El bot queda operando solo con Scalping y
-        // Rebote, armadas desde cero para esa disciplina de tiempo corto.
+        // Reversión PAUSADA desde el 30/7 — Tendencia se reactiva el 31/7,
+        // corriendo específicamente en 30m (no 1h/4h como antes) — término
+        // medio real entre los 15-30 min de Scalping/Rebote y las 8+ horas
+        // que llegaba a tardar Tendencia en 1h/4h.
         // const a = analyzeImproved(closes, highs, lows);
         // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        // const b = analyzeTrendFollow(closes, highs, lows);
-        // if (b && b.signal !== 'NEUTRO') {
-        //   const goodEntry = await checkGoodEntry15m(pair, b.direction);
-        //   if (goodEntry) {
-        //     signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-        //   } else {
-        //     console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
-        //   }
-        // } else if (b) {
-        //   signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-        // }
+        const b = analyzeTrendFollow(closes, highs, lows);
+        if (b && b.signal !== 'NEUTRO') {
+          const goodEntry = await checkGoodEntry15m(pair, b.direction);
+          if (goodEntry) {
+            signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+          } else {
+            console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
+          }
+        }
         // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
         // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
         // alcanza para detectar un rango operable de verdad. Queda el código

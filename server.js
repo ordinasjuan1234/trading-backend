@@ -1169,6 +1169,23 @@ async function runAutoCheckInner() {
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
+      // Salida por reversión (Scalping): si aparece un cruce de medias en CONTRA
+      // de la posición, el movimiento que la abrió ya se dio vuelta — cerramos
+      // y aseguramos lo que haya, en vez de esperar ciegamente al TP fijo o al
+      // límite de tiempo. Es "tomar la mejor acción, no la peor".
+      if (t.strategy === 'Scalping') {
+        try {
+          const { closes: closesRev } = await fetchKlines(t.pair, '5m', 40);
+          const ema9r = calcEMA(closesRev, 9), ema21r = calcEMA(closesRev, 21);
+          const reversedAgainstLong = t.signal === 'COMPRAR' && ema9r < ema21r;
+          const reversedAgainstShort = t.signal === 'VENDER' && ema9r > ema21r;
+          if (reversedAgainstLong || reversedAgainstShort) {
+            await closeTradeById(t.id, currentPrice, 'Salida por reversión');
+            continue;
+          }
+        } catch (e) { console.log('Reversal check error:', e.message); }
+      }
+
       // TP/SL ahora se detectan por mecha (high/low), pero el cierre se registra
       // al precio EXACTO del TP/SL (así como llenaría una orden real), no al
       // precio de cierre de la vela, que puede ser distinto.

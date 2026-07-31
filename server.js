@@ -400,9 +400,10 @@ function analyzeRebote(closes, highs, lows) {
   const price = closes[n - 1];
   const atr = calcATR(highs, lows, closes) || price * 0.01;
   let entry = price, tp, sl;
-  // Objetivos chicos a propósito — la idea es resolverse rápido, no esperar horas
-  if (signal === 'COMPRAR') { tp = price + atr * 1.2; sl = price - atr * 0.8; }
-  else if (signal === 'VENDER') { tp = price - atr * 1.2; sl = price + atr * 0.8; }
+  // Objetivos agrandados (30/7, a pedido de Juan) — los anteriores eran
+  // demasiado chicos en dólares frente a la comisión pagada.
+  if (signal === 'COMPRAR') { tp = price + atr * 2.2; sl = price - atr * 1.4; }
+  else if (signal === 'VENDER') { tp = price - atr * 2.2; sl = price + atr * 1.4; }
   else { tp = price + atr; sl = price - atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
   return { signal, direction, confidence, price, entry, tp, sl, rr, strategy: 'Rebote', atr };
@@ -435,9 +436,21 @@ function detectMicroRegime(opens, highs, lows, closes, volumes) {
   const baseVol = volumes.slice(-lookback, -5).reduce((a, b) => a + b, 0) / Math.max(1, lookback - 5);
   const volConfirms = recentVol > baseVol * 1.05;
 
+  // Detección de desaceleración: comparamos el tamaño de las últimas 4 velas
+  // contra las 4 anteriores a esas — si vienen achicándose, el impulso se
+  // está agotando, aunque la pendiente general todavía diga "tendencia". Es
+  // justo el momento más incierto, mejor esperar a que se defina de nuevo.
+  const recentBodies = [];
+  for (let i = n - 4; i < n; i++) recentBodies.push(Math.abs(closes[i] - opens[i]));
+  const priorBodies = [];
+  for (let i = n - 8; i < n - 4; i++) priorBodies.push(Math.abs(closes[i] - opens[i]));
+  const avgRecentBody = recentBodies.reduce((a, b) => a + b, 0) / recentBodies.length;
+  const avgPriorBody = priorBodies.reduce((a, b) => a + b, 0) / priorBodies.length;
+  const isDecelerating = avgPriorBody > 0 && avgRecentBody < avgPriorBody * 0.6;
+
   const slopePct = (closes[n - 1] - closes[n - lookback]) / closes[n - lookback];
-  const isTrending = adx !== null && adx >= 20 && bodyRatio >= 0.45 && volConfirms;
-  return { isTrending, adx, bodyRatio, volConfirms, slopePct, direction: slopePct >= 0 ? 'up' : 'down' };
+  const isTrending = adx !== null && adx >= 20 && bodyRatio >= 0.45 && volConfirms && !isDecelerating;
+  return { isTrending, adx, bodyRatio, volConfirms, isDecelerating, slopePct, direction: slopePct >= 0 ? 'up' : 'down' };
 }
 
 function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m, volumes1m) {
@@ -447,24 +460,24 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
   const regime = (opens1m && closes1m) ? detectMicroRegime(opens1m, highs1m, lows1m, closes1m, volumes1m) : { isTrending: false, direction: 'lateral' };
 
   let signal = 'NEUTRO', direction = 'ESPERAR', confidence = 0;
+  let lateralTp1 = null, lateralTp2 = null, lateralSl = null;
 
   if (regime.isTrending) {
-    // Hay tendencia clara en el corto plazo (aunque sea en serrucho) — la
-    // seguimos con el cruce de medias, no peleamos contra ella.
+    // Hay tendencia clara en el corto plazo (aunque sea en serrucho) — entra
+    // mientras la tendencia SIGA confirmada por el detector (pendiente,
+    // volumen, sin desacelerar), no solo en el instante exacto del cruce.
+    // Antes solo entraba en el segundo que el cruce se confirmaba — si la
+    // tendencia ya venía corriendo hace 10-15 velas, el bot se la perdía.
     const ema9 = calcEMA(closes, 9), ema21 = calcEMA(closes, 21);
-    const closesPrev = closes.slice(0, -1);
-    const ema9Prev = calcEMA(closesPrev, 9), ema21Prev = calcEMA(closesPrev, 21);
-    const closesPrev2 = closes.slice(0, -2);
-    const ema9Prev2 = calcEMA(closesPrev2, 9), ema21Prev2 = calcEMA(closesPrev2, 21);
-    if (ema9 && ema21 && ema9Prev && ema21Prev && ema9Prev2 && ema21Prev2) {
+    if (ema9 && ema21) {
       const rsiSeries = calcRSISeries(closes, 14);
       const rsi = rsiSeries[rsiSeries.length - 1];
-      const crossUp = ema9 > ema21 && ema9Prev > ema21Prev && ema9Prev2 <= ema21Prev2;
-      const crossDown = ema9 < ema21 && ema9Prev < ema21Prev && ema9Prev2 >= ema21Prev2;
-      if (crossUp && rsi < 70 && regime.direction === 'up') {
+      const alignedUp = ema9 > ema21; // el promedio corto sigue por encima del largo
+      const alignedDown = ema9 < ema21;
+      if (alignedUp && rsi < 70 && regime.direction === 'up') {
         signal = 'COMPRAR'; direction = 'LARGO';
         confidence = Math.round(Math.min(88, 65 + (70 - rsi) / 2));
-      } else if (crossDown && rsi > 30 && regime.direction === 'down') {
+      } else if (alignedDown && rsi > 30 && regime.direction === 'down') {
         signal = 'VENDER'; direction = 'SHORT';
         confidence = Math.round(Math.min(88, 65 + (rsi - 30) / 2));
       }
@@ -486,19 +499,34 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
       signal = 'VENDER'; direction = 'SHORT';
       confidence = Math.round(70 + (posInRange - 0.75) * 40);
     }
+    // El objetivo en lateral es el LADO OPUESTO del rango real (no un ATR
+    // genérico) — comprás en el piso, apuntás al techo, y viceversa. El SL
+    // queda un poco más allá del propio límite del rango, dándole paciencia
+    // real en vez de cortar por el ruido normal del vaivén lateral.
+    if (signal === 'COMPRAR') {
+      lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
+    } else if (signal === 'VENDER') {
+      lateralTp1 = rangeTop - rangeSize * 0.6; lateralTp2 = rangeBottom; lateralSl = rangeTop + atr * 0.5;
+    }
   }
 
   let entry = price, tp1, tp2, sl;
-  // Objetivos pensados para 15-30 minutos: TP1 cerca, TP2 un poco más lejos.
-  if (signal === 'COMPRAR') {
-    tp1 = price + atr * 0.8; tp2 = price + atr * 1.6; sl = price - atr * 1.0;
+  // Objetivos agrandados (30/7, a pedido de Juan) — los anteriores eran
+  // demasiado chicos en dólares, la comisión se comía casi toda la ganancia
+  // aunque tocaran TP. Ahora apuntan a movimientos más parecidos a los que
+  // busca en manual, no solo a resolverse rápido.
+  if (lateralTp1 !== null) {
+    // Lateral: usamos el objetivo del rango real, no el ATR genérico.
+    tp1 = lateralTp1; tp2 = lateralTp2; sl = lateralSl;
+  } else if (signal === 'COMPRAR') {
+    tp1 = price + atr * 1.5; tp2 = price + atr * 3.0; sl = price - atr * 1.8;
   } else if (signal === 'VENDER') {
-    tp1 = price - atr * 0.8; tp2 = price - atr * 1.6; sl = price + atr * 1.0;
+    tp1 = price - atr * 1.5; tp2 = price - atr * 3.0; sl = price + atr * 1.8;
   } else {
     tp1 = price + atr; tp2 = price + atr * 2; sl = price - atr;
   }
   const rr = Math.abs(tp2 - entry) / Math.abs(sl - entry);
-  const regimeLabel = regime.isTrending ? `Tendencia ${regime.direction}` : 'Lateral';
+  const regimeLabel = regime.isTrending ? `Tendencia ${regime.direction}` : (regime.isDecelerating ? 'Desacelerando (se esperó)' : 'Lateral');
   return { signal, direction, confidence, price, entry, tp: tp1, tp2, sl, rr, strategy: 'Scalping', atr, regime: regimeLabel };
 }
 
@@ -1165,7 +1193,7 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.5 : (t.strategy === 'Rango' ? 2 : 48); // Scalping y Rebote apuntan a 15-30 min — necesitan margen real para que el precio se mueva con volumen
+      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.75 : (t.strategy === 'Rango' ? 2 : 48); // 45 min — con objetivos más grandes (30/7), necesitan más margen de tiempo para alcanzarlos
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 
@@ -1173,7 +1201,10 @@ async function runAutoCheckInner() {
       // de la posición, el movimiento que la abrió ya se dio vuelta — cerramos
       // y aseguramos lo que haya, en vez de esperar ciegamente al TP fijo o al
       // límite de tiempo. Es "tomar la mejor acción, no la peor".
-      if (t.strategy === 'Scalping') {
+      // OJO: esto SOLO aplica a la rama de tendencia — en la rama lateral, el
+      // cruce de medias va y viene todo el tiempo (es ruido normal del vaivén),
+      // aplicarle esto mismo cerraba operaciones laterales en segundos.
+      if (t.strategy === 'Scalping' && t.subStrategy === 'Scalping-Tendencia') {
         try {
           const { closes: closesRev } = await fetchKlines(t.pair, '5m', 40);
           const ema9r = calcEMA(closesRev, 9), ema21r = calcEMA(closesRev, 21);

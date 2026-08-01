@@ -489,19 +489,23 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
       }
     }
   } else {
-    // Genuinamente lateral: comprar cerca del piso del rango reciente (30 min
-    // ≈ últimas 6 velas de 5m), vender cerca del techo — y viceversa.
+    // Scalping-Lateral PAUSADA (31/7, noche) — evidencia acumulada de fallo
+    // repetido: 0% de aciertos en 16 operaciones antes del primer arreglo, y
+    // después de 3 correcciones más, seguía perdiendo la mayoría (42 de 50).
+    // Causa nueva encontrada: el objetivo se calcula como fracción del rango
+    // observado en 30 min — si el mercado está tranquilo (rango angosto), el
+    // objetivo es tan chico que ni tocándolo cubre la comisión. Antes de
+    // reactivarla, hay que agregar un piso mínimo de tamaño de rango (relativo
+    // al ATR) para no operar cuando el rango es demasiado angosto para valer
+    // la pena. Queda el código intacto, comentado el disparo de señal.
+    /*
     const rangeLookback = Math.min(6, highs.length);
     const recentHighs = highs.slice(-rangeLookback);
     const recentLows = lows.slice(-rangeLookback);
     const rangeTop = Math.max(...recentHighs);
     const rangeBottom = Math.min(...recentLows);
     const rangeSize = rangeTop - rangeBottom || price * 0.001;
-    const posInRange = (price - rangeBottom) / rangeSize; // 0 = piso, 1 = techo
-    // Umbral más exigente (31/7, a pedido de Juan) — antes entraba con solo
-    // acercarse al 25%/75% del rango, generando entradas de baja convicción
-    // que terminaban cortándose "por las dudas" y pagando comisión igual.
-    // Ahora exige estar genuinamente cerca del extremo (15%/85%).
+    const posInRange = (price - rangeBottom) / rangeSize;
     if (posInRange <= 0.15) {
       signal = 'COMPRAR'; direction = 'LARGO';
       confidence = Math.round(75 + (0.15 - posInRange) * 60);
@@ -509,10 +513,12 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
       signal = 'VENDER'; direction = 'SHORT';
       confidence = Math.round(75 + (posInRange - 0.85) * 60);
     }
-    // El objetivo en lateral es el LADO OPUESTO del rango real (no un ATR
-    // genérico) — comprás en el piso, apuntás al techo, y viceversa. El SL
-    // queda un poco más allá del propio límite del rango, dándole paciencia
-    // real en vez de cortar por el ruido normal del vaivén lateral.
+    if (signal === 'COMPRAR') {
+      lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
+    } else if (signal === 'VENDER') {
+      lateralTp1 = rangeTop - rangeSize * 0.6; lateralTp2 = rangeBottom; lateralSl = rangeTop + atr * 0.5;
+    }
+    */
     if (signal === 'COMPRAR') {
       lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
     } else if (signal === 'VENDER') {

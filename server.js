@@ -39,13 +39,13 @@ const DEFAULT_STATE = {
   openTrades: [], // Multi-posición: una operación abierta por par como máximo
   autoMode: false,
   autoPairs: ["BTCUSDT", "ETHUSDT"], // Validated by backtest: positive results in 180 days
-  autoTFs: ["4h"], // Validated by backtest: 4h gives best results vs 15m/1h
-  minConfidence: 70,
+  autoTFs: ["30m"], // Actualizado 1/8 — Tendencia corre en 30m (término medio entre 15-30min de Scalping/Rebote y las 48hs de antes)
+  minConfidence: 90,
   requireMTF: false, // Only one TF now (4h), so multi-TF confirmation not needed
   maxDailyGainPct: 5,
   maxDailyLossPct: 3,
-  positionSizePct: 20, // % del capital por operación individual (probando 10/15/20)
-  subSlThresholdMin: 5, // minutos de desacuerdo sostenido en 15m antes de cortar (probando 5/15/30)
+  positionSizePct: 30, // Actualizado 1/8 — bajado de 60% tras evidencia de pérdidas más grandes sin mejor filo
+  subSlThresholdMin: 15, // Actualizado 1/8
   tpAtrMultiplier: 3.0, // qué tan lejos pide el TP en múltiplos de ATR (probando 2/3/4 — el SL siempre es la mitad, R:R 2:1 fijo)
   cooldownMinutes: 30, // minutos de enfriamiento por par+dirección después de un cierre por Sub-SL
   pairCooldowns: {}, // { "BTCUSDT-VENDER": timestampHastaElQueEstaBloqueado }

@@ -1190,7 +1190,12 @@ async function runAutoCheckInner() {
           if (contradicts && notYetProfitable && volumeConfirms) {
             t.trendDisagreeCount = (t.trendDisagreeCount || 0) + 1;
           } else {
-            t.trendDisagreeCount = 0;
+            // Antes: reseteaba a 0 con un solo desacuerdo puntual, obligando a
+            // 15 chequeos CONSECUTIVOS perfectos — casi nunca pasaba rápido,
+            // y mientras tanto el precio seguía en contra sin protección real.
+            // Ahora: descuenta de a 1, tolera ruido de un minuto sin perder
+            // toda la racha, pero sigue exigiendo desacuerdo sostenido de fondo.
+            t.trendDisagreeCount = Math.max(0, (t.trendDisagreeCount || 0) - 1);
           }
           const DISAGREE_THRESHOLD = state.subSlThresholdMin || 5; // minutos de desacuerdo sostenido (chequeo cada 60s ≈ 1 por minuto)
           if (t.trendDisagreeCount >= DISAGREE_THRESHOLD) {

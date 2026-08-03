@@ -957,6 +957,26 @@ async function partialCloseTrade(t, exitPrice) {
   sendTelegram(`${emoji} GANANCIA PARCIAL ASEGURADA (50%)\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nPnL parcial: ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nQueda abierto el otro 50%, protegido con trailing stop.`);
 }
 
+// Una operación con toma parcial deja DOS filas en state.trades con el mismo
+// id (el pedazo parcial + el cierre final) — contarlas por separado como
+// "ganada"/"perdida" es engañoso: una operación puede tener un parcial en
+// verde y cerrar en rojo neto, y las dos filas sueltas la mostrarían mal.
+// Esto agrupa por id y clasifica ganada/perdida sobre la SUMA neta real.
+function summarizeTradesByOutcome(trades) {
+  const byId = {};
+  for (const t of trades) {
+    const key = t.id || Math.random(); // por si alguna fila vieja no tiene id
+    if (!byId[key]) byId[key] = { pnl: 0, subStrategy: t.subStrategy, strategy: t.strategy };
+    byId[key].pnl += t.pnl;
+  }
+  const netTrades = Object.values(byId);
+  const total = netTrades.length;
+  const wins = netTrades.filter(nt => nt.pnl >= 0).length;
+  const losses = total - wins;
+  const pnlTotal = netTrades.reduce((s, nt) => s + nt.pnl, 0);
+  return { total, wins, losses, winRate: total > 0 ? Math.round((wins / total) * 1000) / 10 : 0, pnlTotal, netTrades };
+}
+
 async function closeTradeById(tradeId, exitPrice, reason) {
   const idx = state.openTrades.findIndex(t => t.id === tradeId);
   if (idx === -1) return;
@@ -1506,12 +1526,13 @@ app.get("/debug/signals", async (req, res) => {
 
 app.get("/stats/scalping-breakdown", (req, res) => {
   const scalpingTrades = state.trades.filter(t => t.strategy === 'Scalping' && t.subStrategy);
+  const { netTrades } = summarizeTradesByOutcome(scalpingTrades);
   const bySubStrat = {};
-  for (const t of scalpingTrades) {
-    if (!bySubStrat[t.subStrategy]) bySubStrat[t.subStrategy] = { total: 0, wins: 0, pnl: 0 };
-    bySubStrat[t.subStrategy].total += 1;
-    bySubStrat[t.subStrategy].pnl += t.pnl;
-    if (t.pnl >= 0) bySubStrat[t.subStrategy].wins += 1;
+  for (const nt of netTrades) {
+    if (!bySubStrat[nt.subStrategy]) bySubStrat[nt.subStrategy] = { total: 0, wins: 0, pnl: 0 };
+    bySubStrat[nt.subStrategy].total += 1;
+    bySubStrat[nt.subStrategy].pnl += nt.pnl;
+    if (nt.pnl >= 0) bySubStrat[nt.subStrategy].wins += 1;
   }
   for (const k in bySubStrat) {
     bySubStrat[k].winRate = Math.round((bySubStrat[k].wins / bySubStrat[k].total) * 1000) / 10;
@@ -1528,14 +1549,10 @@ app.get("/stats/all-modes", async (req, res) => {
       const trades = (mode === state.tradingMode)
         ? state.trades
         : (stateCollection ? (await loadFinancialDoc(mode)).trades : []);
-      const total = trades.length;
-      const wins = trades.filter(t => t.pnl >= 0).length;
+      const { total, wins, losses, winRate, pnlTotal } = summarizeTradesByOutcome(trades);
       result[mode] = {
-        total,
-        wins,
-        losses: total - wins,
-        winRate: total > 0 ? Math.round((wins / total) * 1000) / 10 : 0,
-        pnlTotal: Math.round(trades.reduce((s, t) => s + t.pnl, 0) * 100) / 100
+        total, wins, losses, winRate,
+        pnlTotal: Math.round(pnlTotal * 100) / 100
       };
     }
     res.json({ success: true, stats: result });
@@ -1787,9 +1804,7 @@ function scheduleDailySummary() {
 }
 
 async function sendDailySummaryMsg() {
-  const wins = state.trades.filter(t => t.pnl > 0).length;
-  const losses = state.trades.filter(t => t.pnl < 0).length;
-  const winRate = state.trades.length > 0 ? Math.round(wins / state.trades.length * 100) : 0;
+  const { wins, losses, winRate } = summarizeTradesByOutcome(state.trades);
   let motivacion = '';
   if (state.dailyPnl > 0 && winRate >= 60) motivacion = '🚀 Excelente día! Seguí así, campeón!';
   else if (state.dailyPnl > 0) motivacion = '🟢 Buen día! De a poco se llega lejos.';

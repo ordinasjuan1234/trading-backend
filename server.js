@@ -1311,10 +1311,12 @@ async function runAutoCheckInner() {
           }
         } else if (hoursOpen >= MAX_HOURS_OPEN) {
           // Prioridad: no cerrar en pérdida solo por haberse cumplido el tiempo.
-          // Si está en pérdida, esperamos más — pero con un límite duro (3x el
-          // original) para no dejar capital atado indefinidamente, que era la
-          // razón original de este cierre.
-          const inLoss = t.signal === 'COMPRAR' ? currentPrice < t.entry : currentPrice > t.entry;
+          // OJO: "en pérdida" se mide por PnL NETO (después de comisión), no solo
+          // si el precio está a favor o en contra — un movimiento a favor pero
+          // muy chico igual da neto negativo una vez descontada la comisión.
+          const pricePct = t.signal === 'COMPRAR' ? (currentPrice - t.entry) / t.entry : (t.entry - currentPrice) / t.entry;
+          const COMMISSION_ROUNDTRIP_PCT = 0.002; // 0.2% comisión ida y vuelta real
+          const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
           const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
           if (!inLoss || hoursOpen >= HARD_MAX_HOURS_OPEN) {
             await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
@@ -1325,9 +1327,11 @@ async function runAutoCheckInner() {
       else if (t.signal === 'VENDER' && recentLow <= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
       else if (t.signal === 'VENDER' && recentHigh >= t.sl) await closeTradeById(t.id, t.sl, 'SL Auto');
       else if (hoursOpen >= MAX_HOURS_OPEN) {
-        // Misma prioridad que arriba: no cortar en pérdida solo por tiempo,
-        // salvo que se llegue al límite duro (3x) para no atar capital para siempre.
-        const inLoss = t.signal === 'COMPRAR' ? currentPrice < t.entry : currentPrice > t.entry;
+        // Misma prioridad que arriba: no cortar en pérdida NETA (no solo precio en
+        // contra) salvo que se llegue al límite duro (3x) para no atar capital.
+        const pricePct = t.signal === 'COMPRAR' ? (currentPrice - t.entry) / t.entry : (t.entry - currentPrice) / t.entry;
+        const COMMISSION_ROUNDTRIP_PCT = 0.002; // 0.2% comisión ida y vuelta real
+        const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
         const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
         if (!inLoss || hoursOpen >= HARD_MAX_HOURS_OPEN) {
           await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);

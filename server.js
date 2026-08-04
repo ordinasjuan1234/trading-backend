@@ -1417,14 +1417,17 @@ async function runAutoCheckInner() {
         // if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
-    // Rebote opera SIEMPRE en 15m, sin importar qué timeframes estén
-    // configurados para las otras estrategias — es la idea de aprovechar el
-    // vaivén de corto plazo, no depende de mirar 1h/4h.
-    try {
-      const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);
-      const d = analyzeRebote(closes15, highs15, lows15);
-      if (d) signals.push({ tf: '15m', pair, signal: d.signal, confidence: d.confidence, analysis: d });
-    } catch (e) { console.log(`Analyze Rebote error ${pair}:`, e.message); }
+    // Rebote PAUSADA (4/8/2026) — backtest de 90 días / 264 operaciones dio
+    // PnL BRUTO negativo (-$28.47, antes de comisión): la señal de entrada no
+    // tiene filo real, no es un problema de calibración de salida. Winrate
+    // 33.3% está por debajo del ~38.9% que necesitaría para empatar con su
+    // R:R de 1:1.57. No reactivar sin un cambio real en analyzeRebote() que
+    // se vuelva a validar con backtest.
+    // try {
+    //   const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);
+    //   const d = analyzeRebote(closes15, highs15, lows15);
+    //   if (d) signals.push({ tf: '15m', pair, signal: d.signal, confidence: d.confidence, analysis: d });
+    // } catch (e) { console.log(`Analyze Rebote error ${pair}:`, e.message); }
 
     // Scalping opera SIEMPRE en 5m — pensada para operar varias veces por
     // hora, 15-30 minutos por operación, con 2 niveles de TP. Además mira 1m

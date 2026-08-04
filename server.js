@@ -1825,6 +1825,127 @@ async function sendDailySummaryMsg() {
 }
 
 // ── Backtest Engine ───────────────────────────────────────
+async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride) {
+  const limit = 1000;
+  const tfMs = { '1m': 60000, '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
+  const totalCandles = Math.min(Math.ceil((days * 86400000) / tfMs), capOverride || 5000);
+  let allCandles = [];
+  let endTime = Date.now();
+
+  while (allCandles.length < totalCandles) {
+    const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}&endTime=${endTime}`);
+    if (!res.ok) throw new Error('Binance fetch failed: ' + res.status);
+    const data = await res.json();
+    if (data.length === 0) break;
+    allCandles = data.concat(allCandles);
+    endTime = data[0][0] - 1;
+    if (data.length < limit) break;
+    if (allCandles.length >= totalCandles) break;
+  }
+
+  return allCandles.map(k => ({
+    time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5])
+  }));
+}
+
+// Backtest de Scalping — necesita 3 timeframes alineados en el tiempo (5m
+// para entrada, 1m para régimen, 15m para tamaño de ATR), a diferencia de
+// las otras estrategias que solo miran uno. Reutiliza analyzeScalping()
+// real, la misma que corre en vivo — no una reescritura.
+async function runScalpingBacktest(pair, days, config) {
+  const { minConfidence, riskPct, initialCapital } = config;
+  const COMMISSION_PCT = 0.001; // 0.1% por lado, igual que el resto de los backtests
+
+  const [candles5, candles1, candles15] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, '5m', days, 6000),
+    fetchHistoricalCandlesWithVolume(pair, '1m', days + 0.1, 12000), // +buffer para el lookback inicial
+    fetchHistoricalCandlesWithVolume(pair, '15m', days + 0.5, 2000)
+  ]);
+
+  // Punteros para no recorrer las series 1m/15m desde cero en cada paso
+  let p1 = 0, p15 = 0;
+  function windowUpTo(arr, ptrStart, targetTime, maxLen) {
+    let i = ptrStart;
+    while (i < arr.length - 1 && arr[i + 1].time <= targetTime) i++;
+    const start = Math.max(0, i - maxLen + 1);
+    return { slice: arr.slice(start, i + 1), newPtr: i };
+  }
+
+  let capital = initialCapital;
+  let trades = [];
+  let openTrade = null;
+  let peakCapital = initialCapital;
+  let maxDrawdown = 0;
+  const MIN_5M_HISTORY = 60;
+
+  for (let i = MIN_5M_HISTORY; i < candles5.length; i++) {
+    const current = candles5[i];
+    const window5 = candles5.slice(Math.max(0, i - MIN_5M_HISTORY), i + 1);
+
+    if (openTrade) {
+      let closed = false, exitPrice = null, reason = null;
+      if (openTrade.signal === 'COMPRAR') {
+        if (current.high >= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.low <= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      } else {
+        if (current.low <= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.high >= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      }
+      if (closed) {
+        const pricePct = openTrade.signal === 'COMPRAR'
+          ? (exitPrice - openTrade.entry) / openTrade.entry
+          : (openTrade.entry - exitPrice) / openTrade.entry;
+        const grossPnl = openTrade.size * pricePct;
+        const commission = openTrade.size * COMMISSION_PCT * 2;
+        const pnl = grossPnl - commission;
+        capital += pnl;
+        trades.push({ ...openTrade, exitPrice, pnl, grossPnl, commission, reason, closeTime: current.time });
+        openTrade = null;
+        if (capital > peakCapital) peakCapital = capital;
+        const dd = (peakCapital - capital) / peakCapital;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+      }
+      continue;
+    }
+
+    const w1 = windowUpTo(candles1, p1, current.time, 30);
+    p1 = w1.newPtr;
+    const w15 = windowUpTo(candles15, p15, current.time, 60);
+    p15 = w15.newPtr;
+    if (w1.slice.length < 20 || w15.slice.length < 20) continue; // sin suficiente historia todavía
+
+    const a = analyzeScalping(
+      window5.map(c => c.close), window5.map(c => c.high), window5.map(c => c.low),
+      w1.slice.map(c => c.open), w1.slice.map(c => c.high), w1.slice.map(c => c.low), w1.slice.map(c => c.close), w1.slice.map(c => c.volume),
+      w15.slice.map(c => c.high), w15.slice.map(c => c.low), w15.slice.map(c => c.close)
+    );
+    if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
+      const size = capital * riskPct;
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence };
+    }
+  }
+
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const winRate = trades.length > 0 ? (wins / trades.length * 100) : 0;
+  const totalPnl = capital - initialCapital;
+  const totalGrossPnl = trades.reduce((s, t) => s + t.grossPnl, 0);
+  const totalCommission = trades.reduce((s, t) => s + t.commission, 0);
+
+  return {
+    trades: trades.length, wins, losses,
+    winRate: winRate.toFixed(1),
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: totalGrossPnl.toFixed(2),
+    totalCommission: totalCommission.toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    candlesUsed: { c5: candles5.length, c1: candles1.length, c15: candles15.length }
+  };
+}
+
 async function fetchHistoricalCandles(pair, tf, days) {
   const limit = 1000;
   const tfMs = { '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
@@ -1928,6 +2049,15 @@ function runBacktestEngine(candles, config) {
 app.post("/backtest", async (req, res) => {
   const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original' } = req.body;
   try {
+    if (strategy === 'scalping') {
+      const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
+      return res.json({
+        success: true,
+        config: { pair, days, minConfidence, riskPct, initialCapital, strategy },
+        dataRange: { note: 'multi-timeframe (5m/1m/15m) — ver candlesUsed en el resultado' },
+        result
+      });
+    }
     const candles = await fetchHistoricalCandles(pair, tf, days);
     if (candles.length < 250) {
       return res.status(400).json({ error: 'No hay suficientes datos históricos para este período' });

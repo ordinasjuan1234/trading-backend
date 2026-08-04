@@ -824,7 +824,7 @@ async function openTrade(pair, tf, analysis) {
   // --- Filtro de edge mínimo sobre comisión real ---
   // Comisión ida y vuelta confirmada: 0.20% (Spot, market, sin BNB)
   // Margen de seguridad 3x -> movimiento proyectado debe ser >= 0.60%
-  const MIN_EDGE_STRATEGIES = ['Tendencia']; // agregar 'Rebote', 'Scalping-Tendencia' de a una, después de juzgar el impacto de esta
+  const MIN_EDGE_STRATEGIES = ['Tendencia', 'Scalping-Tendencia']; // Rebote ya pausada (sin filo); Scalping-Tendencia sumada el 4/8 tras backtest: bruto +$7.60 pero comisión -$20.24 — filo real, muy chico frente al costo
   const MIN_EDGE_PCT = 0.006;
 
   const stratKey = analysis.regime

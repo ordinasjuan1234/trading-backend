@@ -1321,13 +1321,17 @@ async function runAutoCheckInner() {
                 await saveState(state);
                 console.log(`${t.pair} SL extendido una vez — la dirección original todavía sostiene`);
               } else {
-                await closeTradeById(t.id, currentPrice, 'SL Auto');
+                // Ejecutar en t.sl (el nivel calculado), no en currentPrice — que
+                // puede haber sobrepasado el stop y agrandar la pérdida real más
+                // allá de lo que el R:R de la estrategia contemplaba. Mismo
+                // criterio que ya usa la rama de Tendencia/Reversión más abajo.
+                await closeTradeById(t.id, t.sl, 'SL Auto');
               }
             } catch (e) {
-              await closeTradeById(t.id, currentPrice, 'SL Auto'); // si falla el chequeo, cortamos por las dudas
+              await closeTradeById(t.id, t.sl, 'SL Auto'); // si falla el chequeo, cortamos por las dudas
             }
           } else {
-            await closeTradeById(t.id, currentPrice, 'SL Auto (tras extensión)');
+            await closeTradeById(t.id, t.sl, 'SL Auto (tras extensión)');
           }
         } else if (hoursOpen >= MAX_HOURS_OPEN) {
           // Prioridad: no cerrar en pérdida solo por haberse cumplido el tiempo.
@@ -1844,8 +1848,11 @@ async function fetchHistoricalCandles(pair, tf, days) {
 
 function runBacktestEngine(candles, config) {
   const { minConfidence, riskPct, initialCapital, strategy = 'original' } = config;
-  const analyzeFn = strategy === 'improved' ? analyzeImproved : analyze;
-  const minHistory = strategy === 'improved' ? 210 : 200;
+  const analyzeFn = strategy === 'improved' ? analyzeImproved : (strategy === 'rebote' ? analyzeRebote : analyze);
+  const minHistory = strategy === 'improved' ? 210 : (strategy === 'rebote' ? 50 : 200);
+  // Comisión real de Binance: 0.1% por lado (entrada + salida) — el motor
+  // original NO la descontaba, dando resultados más optimistas de lo real.
+  const COMMISSION_PCT = 0.001;
   let capital = initialCapital;
   let trades = [];
   let openTrade = null;
@@ -1872,9 +1879,11 @@ function runBacktestEngine(candles, config) {
         const pricePct = openTrade.signal === 'COMPRAR' 
           ? (exitPrice - openTrade.entry) / openTrade.entry 
           : (openTrade.entry - exitPrice) / openTrade.entry;
-        const pnl = openTrade.size * pricePct;
+        const grossPnl = openTrade.size * pricePct;
+        const commission = openTrade.size * COMMISSION_PCT * 2; // ida + vuelta
+        const pnl = grossPnl - commission;
         capital += pnl;
-        trades.push({ ...openTrade, exitPrice, pnl, reason, closeTime: current.time });
+        trades.push({ ...openTrade, exitPrice, pnl, grossPnl, commission, reason, closeTime: current.time });
         openTrade = null;
         if (capital > peakCapital) peakCapital = capital;
         const dd = (peakCapital - capital) / peakCapital;
@@ -1895,12 +1904,16 @@ function runBacktestEngine(candles, config) {
   const winRate = trades.length > 0 ? (wins / trades.length * 100) : 0;
   const totalPnl = capital - initialCapital;
   const totalReturn = (totalPnl / initialCapital) * 100;
+  const totalGrossPnl = trades.reduce((s, t) => s + t.grossPnl, 0);
+  const totalCommission = trades.reduce((s, t) => s + t.commission, 0);
   
   return {
     trades: trades.length, wins, losses,
     winRate: winRate.toFixed(1),
     finalCapital: capital.toFixed(2),
     totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: totalGrossPnl.toFixed(2),
+    totalCommission: totalCommission.toFixed(2),
     totalReturn: totalReturn.toFixed(2),
     maxDrawdown: (maxDrawdown * 100).toFixed(2)
   };

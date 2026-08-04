@@ -1851,8 +1851,11 @@ async function fetchHistoricalCandles(pair, tf, days) {
 
 function runBacktestEngine(candles, config) {
   const { minConfidence, riskPct, initialCapital, strategy = 'original' } = config;
-  const analyzeFn = strategy === 'improved' ? analyzeImproved : (strategy === 'rebote' ? analyzeRebote : analyze);
-  const minHistory = strategy === 'improved' ? 210 : (strategy === 'rebote' ? 50 : 200);
+  const analyzeFn = strategy === 'improved' ? analyzeImproved
+    : strategy === 'rebote' ? analyzeRebote
+    : strategy === 'tendencia' ? analyzeTrendFollow
+    : analyze;
+  const minHistory = strategy === 'improved' ? 210 : strategy === 'rebote' ? 50 : strategy === 'tendencia' ? 70 : 200;
   // Comisión real de Binance: 0.1% por lado (entrada + salida) — el motor
   // original NO la descontaba, dando resultados más optimistas de lo real.
   const COMMISSION_PCT = 0.001;

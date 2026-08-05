@@ -740,7 +740,7 @@ function analyzeTrendFollowAdx(closes, highs, lows) {
   else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
   else { sl = price - atr; tp = price + atr; }
   const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia-ADX', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
 }
 
 // Estrategia de RANGO: solo opera cuando el ADX confirma mercado LATERAL
@@ -1458,7 +1458,10 @@ async function runAutoCheckInner() {
         // que llegaba a tardar Tendencia en 1h/4h.
         // const a = analyzeImproved(closes, highs, lows);
         // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        const b = analyzeTrendFollow(closes, highs, lows);
+        // Tendencia con TP/SL escalado por ADX (5/8/2026) — backtest de 180
+        // días mostró +11,96% neto vs +2,16% de la versión anterior (mismo
+        // riesgo, drawdown casi igual). Reemplaza a analyzeTrendFollow().
+        const b = analyzeTrendFollowAdx(closes, highs, lows);
         if (b && b.signal !== 'NEUTRO') {
           const goodEntry = await checkGoodEntry15m(pair, b.direction);
           if (goodEntry) {
@@ -1587,7 +1590,7 @@ app.get("/debug/signals", async (req, res) => {
       const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
       const a = analyzeImproved(closes, highs, lows);
       if (a) results.push({ tf, strategy: 'Reversión', signal: a.signal, confidence: a.confidence, ...withDistances(a) });
-      const b = analyzeTrendFollow(closes, highs, lows);
+      const b = analyzeTrendFollowAdx(closes, highs, lows);
       if (b) results.push({ tf, strategy: 'Tendencia', signal: b.signal, confidence: b.confidence, ...withDistances(b) });
     }
     const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);

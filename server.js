@@ -1342,8 +1342,12 @@ async function runAutoCheckInner() {
           const COMMISSION_ROUNDTRIP_PCT = 0.002; // 0.2% comisión ida y vuelta real
           const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
           const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
-          if (!inLoss || hoursOpen >= HARD_MAX_HOURS_OPEN) {
-            await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
+          const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
+          if (!inLoss || hitHardCap) {
+            // El motivo distingue si cerró al límite normal (ya en ganancia/neutro)
+            // o si esperó hasta el límite duro sin lograr salir de la pérdida.
+            const reason = hitHardCap && inLoss ? `Cierre por tiempo (límite duro ${HARD_MAX_HOURS_OPEN}hs, seguía en pérdida)` : `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`;
+            await closeTradeById(t.id, currentPrice, reason);
           }
         }
       } else if (t.signal === 'COMPRAR' && recentHigh >= t.tp) await closeTradeById(t.id, t.tp, 'TP Auto');
@@ -1357,9 +1361,11 @@ async function runAutoCheckInner() {
         const COMMISSION_ROUNDTRIP_PCT = 0.002; // 0.2% comisión ida y vuelta real
         const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
         const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
-        if (!inLoss || hoursOpen >= HARD_MAX_HOURS_OPEN) {
-          await closeTradeById(t.id, currentPrice, `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`);
-          sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba más de ${MAX_HOURS_OPEN}hs abierta sin tocar TP/SL\nSe cerró al precio de mercado para liberar el capital.`);
+        const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
+        if (!inLoss || hitHardCap) {
+          const reason = hitHardCap && inLoss ? `Cierre por tiempo (límite duro ${HARD_MAX_HOURS_OPEN}hs, seguía en pérdida)` : `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`;
+          await closeTradeById(t.id, currentPrice, reason);
+          sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba ${hoursOpen.toFixed(2)}hs abierta sin tocar TP/SL${hitHardCap && inLoss ? ' (esperó hasta el límite duro, seguía en pérdida)' : ''}\nSe cerró al precio de mercado para liberar el capital.`);
         }
       }
     } catch (e) { console.log('Check open trade error:', e.message); }

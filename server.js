@@ -1515,22 +1515,35 @@ app.get("/", (req, res) => {
 
 app.get("/debug/signals", async (req, res) => {
   const pair = req.query.pair || 'ETHUSDT';
+  // Agrega entrada/TP/SL y % de distancia a cada resultado — así se puede
+  // ver qué tan largo o corto es el TP sin esperar a que abra una operación real.
+  function withDistances(analysis) {
+    if (!analysis || !analysis.tp || !analysis.sl || !analysis.entry) return {};
+    const tpPct = Math.abs(analysis.tp - analysis.entry) / analysis.entry * 100;
+    const slPct = Math.abs(analysis.sl - analysis.entry) / analysis.entry * 100;
+    return {
+      entry: analysis.entry,
+      tp: analysis.tp, tpPct: tpPct.toFixed(2) + '%',
+      sl: analysis.sl, slPct: slPct.toFixed(2) + '%',
+      rr: analysis.rr ? analysis.rr.toFixed(2) : null
+    };
+  }
   try {
     const results = [];
     for (const tf of ['1h', '4h']) {
       const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
       const a = analyzeImproved(closes, highs, lows);
-      if (a) results.push({ tf, strategy: 'Reversión', signal: a.signal, confidence: a.confidence });
+      if (a) results.push({ tf, strategy: 'Reversión', signal: a.signal, confidence: a.confidence, ...withDistances(a) });
       const b = analyzeTrendFollow(closes, highs, lows);
-      if (b) results.push({ tf, strategy: 'Tendencia', signal: b.signal, confidence: b.confidence });
+      if (b) results.push({ tf, strategy: 'Tendencia', signal: b.signal, confidence: b.confidence, ...withDistances(b) });
     }
     const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);
     const d = analyzeRebote(closes15, highs15, lows15);
-    if (d) results.push({ tf: '15m', strategy: 'Rebote', signal: d.signal, confidence: d.confidence });
+    if (d) results.push({ tf: '15m', strategy: 'Rebote', signal: d.signal, confidence: d.confidence, ...withDistances(d) });
     const { closes: closes5, highs: highs5, lows: lows5 } = await fetchKlines(pair, '5m', 40);
     const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
     const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1, highs15, lows15, closes15);
-    if (e) results.push({ tf: '5m', strategy: 'Scalping', signal: e.signal, confidence: e.confidence, regimen: e.regime });
+    if (e) results.push({ tf: '5m', strategy: 'Scalping', signal: e.signal, confidence: e.confidence, regimen: e.regime, ...withDistances(e) });
     res.json({ success: true, pair, minConfidence: state.minConfidence, results });
   } catch (err) {
     res.status(500).json({ error: err.message });

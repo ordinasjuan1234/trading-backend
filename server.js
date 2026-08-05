@@ -690,6 +690,59 @@ function analyzeTrendFollow(closes, highs, lows) {
   return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal };
 }
 
+// Variante experimental para backtest (5/8/2026): igual que analyzeTrendFollow,
+// pero además de escalar por volatilidad de precio, escala la distancia del
+// TP/SL por la FUERZA de la tendencia (ADX) — hipótesis del usuario: si el ADX
+// recién cruzó el mínimo (20-25), la tendencia es débil/reciente y conviene un
+// objetivo más cerca; si el ADX es alto (35+), hay más convicción real y
+// conviene dejarlo correr más lejos. Mantiene el mismo R:R 2:1 — solo cambia
+// la distancia absoluta, no la proporción entre SL y TP.
+function analyzeTrendFollowAdx(closes, highs, lows) {
+  if (!closes || closes.length < 60) return null;
+  const price = closes[closes.length - 1];
+  const ema20Now = calcEMA(closes, 20);
+  const ema20Before = calcEMA(closes.slice(0, -5), 20);
+  const ema50Now = calcEMA(closes, 50);
+  const ema50Before = calcEMA(closes.slice(0, -5), 50);
+  if (!ema20Now || !ema50Now || !ema20Before || !ema50Before) return null;
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (price > ema20Now) bull += 1; else bear += 1;
+  if (price > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema20Before) bull += 2; else if (ema20Now < ema20Before) bear += 2;
+  if (ema50Now > ema50Before) bull += 1; else if (ema50Now < ema50Before) bear += 1;
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal === null || adxVal >= 20;
+  if (diff >= 4 && isVolatileEnough && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+  }
+  let entry = price, tp, sl;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const baseTp = state.tpAtrMultiplier || 3.0;
+  let adxScale = 1.0;
+  if (adxVal !== null) {
+    if (adxVal >= 35) adxScale = 1.3;      // tendencia muy fuerte -> objetivo más lejos
+    else if (adxVal < 25) adxScale = 0.7;  // tendencia recién confirmada/débil -> objetivo más cerca
+  }
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale * adxScale, tpMultiplier = baseTp * vol.multiplierScale * adxScale;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia-ADX', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
+}
+
 // Estrategia de RANGO: solo opera cuando el ADX confirma mercado LATERAL
 // (sin tendencia real). En vez de forzar una apuesta direccional que no
 // existe, opera el rebote entre el piso y el techo del rango reciente —
@@ -1994,8 +2047,9 @@ function runBacktestEngine(candles, config) {
   const analyzeFn = strategy === 'improved' ? analyzeImproved
     : strategy === 'rebote' ? analyzeRebote
     : strategy === 'tendencia' ? analyzeTrendFollow
+    : strategy === 'tendencia-adx' ? analyzeTrendFollowAdx
     : analyze;
-  const minHistory = strategy === 'improved' ? 210 : strategy === 'rebote' ? 50 : strategy === 'tendencia' ? 70 : 200;
+  const minHistory = strategy === 'improved' ? 210 : strategy === 'rebote' ? 50 : (strategy === 'tendencia' || strategy === 'tendencia-adx') ? 70 : 200;
   // Comisión real de Binance: 0.1% por lado (entrada + salida) — el motor
   // original NO la descontaba, dando resultados más optimistas de lo real.
   const COMMISSION_PCT = 0.001;

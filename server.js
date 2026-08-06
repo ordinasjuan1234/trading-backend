@@ -743,6 +743,25 @@ function analyzeTrendFollowAdx(closes, highs, lows) {
   return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
 }
 
+// Variante experimental (5/8/2026) — misma lógica que analyzeTrendFollowAdx,
+// pero exige además que el timeframe corto (15m) no esté en un movimiento
+// inmediato contrario justo al momento de entrar. Hipótesis del usuario:
+// el bot ve "largo" en la tendencia mayor, pero si el precio en ese instante
+// puntual viene bajando en el corto plazo, igual entra — y eso explicó las
+// pérdidas del 5/8. Regla simple: el último cierre corto tiene que estar del
+// lado correcto de su propia EMA9 (no en medio de una sacudida en contra).
+function analyzeTrendFollowAdxSubfilter(closes, highs, lows, closesShort) {
+  const base = analyzeTrendFollowAdx(closes, highs, lows);
+  if (!base || base.signal === 'NEUTRO') return base;
+  if (!closesShort || closesShort.length < 12) return base; // sin data corta suficiente, no filtramos
+  const emaShort = calcEMA(closesShort, 9);
+  if (!emaShort) return base;
+  const lastShortClose = closesShort[closesShort.length - 1];
+  const shortAgrees = base.signal === 'COMPRAR' ? lastShortClose >= emaShort : lastShortClose <= emaShort;
+  if (!shortAgrees) return { ...base, signal: 'NEUTRO', direction: 'ESPERAR', filteredBySubTF: true };
+  return base;
+}
+
 // Estrategia de RANGO: solo opera cuando el ADX confirma mercado LATERAL
 // (sin tendencia real). En vez de forzar una apuesta direccional que no
 // existe, opera el rebote entre el piso y el techo del rango reciente —
@@ -1928,6 +1947,88 @@ async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride) {
 // para entrada, 1m para régimen, 15m para tamaño de ATR), a diferencia de
 // las otras estrategias que solo miran uno. Reutiliza analyzeScalping()
 // real, la misma que corre en vivo — no una reescritura.
+// Backtest de Tendencia-ADX + filtro de sub-timeframe (5/8/2026) — necesita
+// dos series alineadas: la principal (4h) para la señal, y una corta (15m)
+// para confirmar que el momento de entrada no está en contra. Comisión real
+// incluida, mismo criterio que el resto de los backtests de hoy.
+async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
+  const { minConfidence, riskPct, initialCapital } = config;
+  const COMMISSION_PCT = 0.001;
+  const tfMs = { '15m': 15*60000, '30m': 30*60000, '1h': 3600000, '4h': 4*3600000 }[tf];
+  const shortTf = '15m';
+
+  const [candlesMain, candlesShort] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000),
+    fetchHistoricalCandlesWithVolume(pair, shortTf, days, Math.min(Math.ceil(days * 96) + 100, 20000))
+  ]);
+
+  let pShort = 0;
+  function windowUpTo(arr, ptrStart, targetTime, maxLen) {
+    let i = ptrStart;
+    while (i < arr.length - 1 && arr[i + 1].time <= targetTime) i++;
+    const start = Math.max(0, i - maxLen + 1);
+    return { slice: arr.slice(start, i + 1), newPtr: i };
+  }
+
+  let capital = initialCapital, trades = [], openTrade = null, peakCapital = initialCapital, maxDrawdown = 0;
+  const MIN_HISTORY = 70;
+
+  for (let i = MIN_HISTORY; i < candlesMain.length; i++) {
+    const current = candlesMain[i];
+    const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
+    const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
+
+    if (openTrade) {
+      let closed = false, exitPrice = null, reason = null;
+      if (openTrade.signal === 'COMPRAR') {
+        if (current.high >= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.low <= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      } else {
+        if (current.low <= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.high >= openTrade.sl) { exitPrice = openTrade.sl; reason = 'SL'; closed = true; }
+      }
+      if (closed) {
+        const pricePct = openTrade.signal === 'COMPRAR' ? (exitPrice - openTrade.entry) / openTrade.entry : (openTrade.entry - exitPrice) / openTrade.entry;
+        const grossPnl = openTrade.size * pricePct;
+        const commission = openTrade.size * COMMISSION_PCT * 2;
+        const pnl = grossPnl - commission;
+        capital += pnl;
+        trades.push({ ...openTrade, exitPrice, pnl, grossPnl, commission, reason, closeTime: current.time });
+        openTrade = null;
+        if (capital > peakCapital) peakCapital = capital;
+        const dd = (peakCapital - capital) / peakCapital;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+      }
+      continue;
+    }
+
+    const wShort = windowUpTo(candlesShort, pShort, current.time, 20);
+    pShort = wShort.newPtr;
+    if (wShort.slice.length < 12) continue;
+
+    const a = analyzeTrendFollowAdxSubfilter(closes, highs, lows, wShort.slice.map(c => c.close));
+    if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
+      const size = capital * riskPct;
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence };
+    }
+  }
+
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const totalPnl = capital - initialCapital;
+  return {
+    trades: trades.length, wins, losses,
+    winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: trades.reduce((s, t) => s + t.grossPnl, 0).toFixed(2),
+    totalCommission: trades.reduce((s, t) => s + t.commission, 0).toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    candlesUsed: { main: candlesMain.length, short: candlesShort.length }
+  };
+}
+
 async function runScalpingBacktest(pair, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001; // 0.1% por lado, igual que el resto de los backtests
@@ -2131,6 +2232,15 @@ app.post("/backtest", async (req, res) => {
         success: true,
         config: { pair, days, minConfidence, riskPct, initialCapital, strategy },
         dataRange: { note: 'multi-timeframe (5m/1m/15m) — ver candlesUsed en el resultado' },
+        result
+      });
+    }
+    if (strategy === 'tendencia-subfilter') {
+      const result = await runTendenciaSubfilterBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital });
+      return res.json({
+        success: true,
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
+        dataRange: { note: 'multi-timeframe (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });
     }

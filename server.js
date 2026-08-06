@@ -1248,7 +1248,10 @@ async function runAutoCheckInner() {
               // tomamos la parcial todavía: el trailing ya quedó protegiendo, y
               // esperamos a que el precio esté realmente donde corresponde.
               const currentMovePct = (currentPrice - t.entry) / t.entry;
-              if (!t.partialTaken && currentMovePct >= MIN_ACTIVATION_PCT) await partialCloseTrade(t, currentPrice);
+              // Tendencia excluida (5/8/2026): el backtest validado (+11.96%)
+              // simula solo TP/SL completo, sin parciales — dejarla tomar
+              // parciales en vivo corre distinto a lo que probamos.
+              if (!t.partialTaken && currentMovePct >= MIN_ACTIVATION_PCT && t.strategy !== 'Tendencia') await partialCloseTrade(t, currentPrice);
             }
           }
         }
@@ -1264,7 +1267,7 @@ async function runAutoCheckInner() {
             if (!wasActive) {
               sendTelegram(`🔒 Trailing stop activado\n${t.pair.replace('USDT','/USDT')} · ${t.tf}\nSL asegurado en $${candidateSl.toFixed(2)} (protege ganancia mínima)`);
               const currentMovePct = (t.entry - currentPrice) / t.entry;
-              if (!t.partialTaken && currentMovePct >= MIN_ACTIVATION_PCT) await partialCloseTrade(t, currentPrice);
+              if (!t.partialTaken && currentMovePct >= MIN_ACTIVATION_PCT && t.strategy !== 'Tendencia') await partialCloseTrade(t, currentPrice);
             }
           }
         }

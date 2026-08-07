@@ -124,6 +124,7 @@ async function initMongo() {
     // 2) Datos financieros del modo que estaba activo (demo/testnet/real, cada uno en su propio documento)
     const financial = await loadFinancialDoc(config.tradingMode || 'demo');
     state = { ...DEFAULT_STATE, ...config, ...financial };
+    console.log(`🔧 Config cargada al arrancar — minConfidence: ${state.minConfidence}, autoTFs: ${JSON.stringify(state.autoTFs)}, positionSizePct: ${state.positionSizePct}`);
 
     // Migración de compatibilidad: si todavía no hay nada guardado en
     // "financial_demo", migramos el capital/trades de "main" una sola vez.
@@ -1731,6 +1732,13 @@ app.get("/state", (req, res) => {
 
 app.post("/state/config", async (req, res) => {
   const { autoPairs, autoTFs, minConfidence, requireMTF, maxDailyGainPct, maxDailyLossPct, positionSizePct, subSlThresholdMin, tpAtrMultiplier, cooldownMinutes } = req.body;
+  // Registro para cazar el bug de reseteo de config — si minConfidence llega
+  // con un valor sospechoso (fuera del rango 50-90 que permite el slider del
+  // panel), queda anotado acá con la IP y el user-agent de origen.
+  if (minConfidence !== undefined && (minConfidence < 50 || minConfidence > 90)) {
+    console.log(`⚠️ SOSPECHOSO: minConfidence=${minConfidence} (fuera del rango 50-90 del slider) — IP: ${req.ip} — UA: ${req.headers['user-agent']} — body completo: ${JSON.stringify(req.body)}`);
+  }
+  console.log(`/state/config recibido — minConfidence: ${minConfidence}, autoTFs: ${JSON.stringify(autoTFs)}, positionSizePct: ${positionSizePct}`);
   if (autoPairs) state.autoPairs = autoPairs;
   if (autoTFs) state.autoTFs = autoTFs;
   if (minConfidence !== undefined) state.minConfidence = minConfidence;

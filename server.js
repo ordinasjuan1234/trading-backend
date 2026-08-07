@@ -1010,6 +1010,7 @@ async function openTrade(pair, tf, analysis) {
     // las dos mitades funciona de verdad, solo el promedio de las dos.
     subStrategy: analysis.regime ? `Scalping-${analysis.regime.startsWith('Tendencia') ? 'Tendencia' : 'Lateral'}` : null,
     tp2: analysis.tp2 || null, // solo Scalping usa un segundo nivel de TP
+    adxScale: analysis.adxScale || 1.0, // para escalar el límite de tiempo junto con el TP (Tendencia)
     // Guardamos el ATR EFECTIVO (la distancia real usada para el SL, ya con el
     // ajuste de volatilidad del día aplicado) — no el ATR crudo — para que el
     // trailing stop se active de forma consistente con el TP/SL real de esta operación.
@@ -1386,7 +1387,14 @@ async function runAutoCheckInner() {
 
       // Time-based safety close: if a trade has been open too long without hitting TP/SL,
       // close it at market price to avoid capital being stuck indefinitely
-      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.75 : (t.strategy === 'Rango' ? 2 : (t.strategy === 'Tendencia' ? 2 : 48)); // Tendencia ahora en 30m con límite de 2hs (antes 48hs, llegaba a tardar un día entero)
+      // Tendencia: si el TP se estiró por ADX fuerte (adxScale > 1), el límite
+      // de tiempo también se estira en la misma proporción — no tiene sentido
+      // pedirle un objetivo más lejos sin darle más tiempo para llegar. Si el
+      // TP se acortó (adxScale < 1), el límite también baja, coherente.
+      const MAX_HOURS_OPEN = (t.strategy === 'Scalping' || t.strategy === 'Rebote') ? 0.75
+        : (t.strategy === 'Rango') ? 2
+        : (t.strategy === 'Tendencia') ? 2 * (t.adxScale || 1.0)
+        : 48;
       const openTimestamp = t.openTimestamp || Date.now();
       const hoursOpen = (Date.now() - openTimestamp) / (1000 * 60 * 60);
 

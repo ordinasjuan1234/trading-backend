@@ -2014,6 +2014,142 @@ async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride) {
 // dos series alineadas: la principal (4h) para la señal, y una corta (15m)
 // para confirmar que el momento de entrada no está en contra. Comisión real
 // incluida, mismo criterio que el resto de los backtests de hoy.
+// Backtest de Tendencia + contra-trade en paralelo (7/8/2026) — simula la
+// idea del usuario: mientras Tendencia sostiene su posición grande (4h/30m),
+// un segundo trade CHICO e independiente aprovecha los movimientos cortos
+// en contra en 15m (cruce EMA5/EMA13 bajista si la principal es larga, o
+// alcista si es corta), con TP/SL ajustados (1x ATR de 15m, simétrico —
+// pensado para capturar el "serrucho", no para acompañar tendencia).
+// Se cierra solo o cuando la posición principal cierra. PnL combinado.
+async function runTendenciaWithCounterBacktest(pair, tf, days, config) {
+  const { minConfidence, riskPct, initialCapital } = config;
+  const COMMISSION_PCT = 0.001;
+  const shortTf = '15m';
+
+  const [candlesMain, candlesShort] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000),
+    fetchHistoricalCandlesWithVolume(pair, shortTf, days, Math.min(Math.ceil(days * 96) + 100, 20000))
+  ]);
+
+  let pShort = 0;
+  function windowUpTo(arr, ptrStart, targetTime, maxLen) {
+    let i = ptrStart;
+    while (i < arr.length - 1 && arr[i + 1].time <= targetTime) i++;
+    const start = Math.max(0, i - maxLen + 1);
+    return { slice: arr.slice(start, i + 1), newPtr: i };
+  }
+
+  let capital = initialCapital, mainTrades = [], counterTrades = [];
+  let openMain = null, openCounter = null;
+  let peakCapital = initialCapital, maxDrawdown = 0;
+  const MIN_HISTORY = 70;
+
+  function closeMain(exitPrice, reason, closeTime) {
+    const pricePct = openMain.signal === 'COMPRAR' ? (exitPrice - openMain.entry) / openMain.entry : (openMain.entry - exitPrice) / openMain.entry;
+    const grossPnl = openMain.size * pricePct;
+    const commission = openMain.size * COMMISSION_PCT * 2;
+    const pnl = grossPnl - commission;
+    capital += pnl;
+    mainTrades.push({ ...openMain, exitPrice, pnl, grossPnl, commission, reason, closeTime });
+    openMain = null;
+  }
+  function closeCounter(exitPrice, reason, closeTime) {
+    const pricePct = openCounter.signal === 'COMPRAR' ? (exitPrice - openCounter.entry) / openCounter.entry : (openCounter.entry - exitPrice) / openCounter.entry;
+    const grossPnl = openCounter.size * pricePct;
+    const commission = openCounter.size * COMMISSION_PCT * 2;
+    const pnl = grossPnl - commission;
+    capital += pnl;
+    counterTrades.push({ ...openCounter, exitPrice, pnl, grossPnl, commission, reason, closeTime });
+    openCounter = null;
+  }
+
+  for (let i = MIN_HISTORY; i < candlesMain.length; i++) {
+    const current = candlesMain[i];
+    const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
+    const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
+
+    const wShort = windowUpTo(candlesShort, pShort, current.time, 30);
+    pShort = wShort.newPtr;
+    const shortCloses = wShort.slice.map(c => c.close);
+    const shortHighs = wShort.slice.map(c => c.high), shortLows = wShort.slice.map(c => c.low);
+    const shortCurrent = wShort.slice[wShort.slice.length - 1];
+
+    if (openMain) {
+      let closed = false, exitPrice = null, reason = null;
+      if (openMain.signal === 'COMPRAR') {
+        if (current.high >= openMain.tp) { exitPrice = openMain.tp; reason = 'TP'; closed = true; }
+        else if (current.low <= openMain.sl) { exitPrice = openMain.sl; reason = 'SL'; closed = true; }
+      } else {
+        if (current.low <= openMain.tp) { exitPrice = openMain.tp; reason = 'TP'; closed = true; }
+        else if (current.high >= openMain.sl) { exitPrice = openMain.sl; reason = 'SL'; closed = true; }
+      }
+      if (closed) {
+        closeMain(exitPrice, reason, current.time);
+        if (openCounter) closeCounter(shortCurrent ? shortCurrent.close : current.close, 'Cierre junto a la principal', current.time);
+        if (capital > peakCapital) peakCapital = capital;
+        const dd = (peakCapital - capital) / peakCapital;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+        continue;
+      }
+
+      // Posición principal sigue abierta — evaluar el contra-trade chico
+      if (openCounter) {
+        if (shortCurrent) {
+          let cClosed = false, cExit = null, cReason = null;
+          if (openCounter.signal === 'COMPRAR') {
+            if (shortCurrent.high >= openCounter.tp) { cExit = openCounter.tp; cReason = 'TP'; cClosed = true; }
+            else if (shortCurrent.low <= openCounter.sl) { cExit = openCounter.sl; cReason = 'SL'; cClosed = true; }
+          } else {
+            if (shortCurrent.low <= openCounter.tp) { cExit = openCounter.tp; cReason = 'TP'; cClosed = true; }
+            else if (shortCurrent.high >= openCounter.sl) { cExit = openCounter.sl; cReason = 'SL'; cClosed = true; }
+          }
+          if (cClosed) closeCounter(cExit, cReason, shortCurrent.time);
+        }
+      } else if (shortCloses.length >= 15) {
+        const ema5 = calcEMA(shortCloses, 5), ema13 = calcEMA(shortCloses, 13);
+        const atrShort = calcATR(shortHighs, shortLows, shortCloses) || shortCurrent.close * 0.002;
+        if (ema5 && ema13) {
+          // Si la principal es larga y el corto plazo cruza bajista -> contra-short.
+          // Si la principal es corta y el corto plazo cruza alcista -> contra-largo.
+          if (openMain.signal === 'COMPRAR' && ema5 < ema13) {
+            const size = capital * (riskPct / 2);
+            openCounter = { signal: 'VENDER', entry: shortCurrent.close, tp: shortCurrent.close - atrShort, sl: shortCurrent.close + atrShort, size, openTime: shortCurrent.time };
+          } else if (openMain.signal === 'VENDER' && ema5 > ema13) {
+            const size = capital * (riskPct / 2);
+            openCounter = { signal: 'COMPRAR', entry: shortCurrent.close, tp: shortCurrent.close + atrShort, sl: shortCurrent.close - atrShort, size, openTime: shortCurrent.time };
+          }
+        }
+      }
+      continue;
+    }
+
+    const a = analyzeTrendFollowAdx(closes, highs, lows);
+    if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
+      const size = capital * riskPct;
+      openMain = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence };
+    }
+  }
+
+  const allTrades = [...mainTrades, ...counterTrades];
+  const wins = allTrades.filter(t => t.pnl > 0).length;
+  const losses = allTrades.filter(t => t.pnl < 0).length;
+  const totalPnl = capital - initialCapital;
+  return {
+    mainTrades: mainTrades.length, counterTrades: counterTrades.length,
+    totalTrades: allTrades.length, wins, losses,
+    winRate: allTrades.length > 0 ? (wins / allTrades.length * 100).toFixed(1) : "0",
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: allTrades.reduce((s, t) => s + t.grossPnl, 0).toFixed(2),
+    totalCommission: allTrades.reduce((s, t) => s + t.commission, 0).toFixed(2),
+    mainPnl: mainTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2),
+    counterPnl: counterTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    candlesUsed: { main: candlesMain.length, short: candlesShort.length }
+  };
+}
+
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001;
@@ -2305,6 +2441,15 @@ app.post("/backtest", async (req, res) => {
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
         dataRange: { note: 'multi-timeframe (' + tf + '/15m) — ver candlesUsed en el resultado' },
+        result
+      });
+    }
+    if (strategy === 'tendencia-counter') {
+      const result = await runTendenciaWithCounterBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital });
+      return res.json({
+        success: true,
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
+        dataRange: { note: 'Tendencia principal (' + tf + ') + contra-trade en paralelo (15m) — ver candlesUsed en el resultado' },
         result
       });
     }

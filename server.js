@@ -2166,7 +2166,7 @@ async function runTendenciaWithCounterBacktest(pair, tf, days, config) {
 // duro 3x" que usa el código real). Usa velas de 15m para simular la vida de
 // la operación después de abrir (proxy razonable del chequeo real de 1m).
 async function runTendenciaRealisticBacktest(pair, tf, days, config) {
-  const { minConfidence, riskPct, initialCapital } = config;
+  const { minConfidence, riskPct, initialCapital, timeLimitMultiplier } = config;
   const COMMISSION_PCT = 0.001;
   const shortTf = '15m';
 
@@ -2208,7 +2208,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     const entry = a.entry, tp = a.tp, sl0 = a.sl, signal = a.signal;
     const atr = Math.abs(entry - sl0) / 1.5;
     const size = capital * riskPct;
-    const MAX_HOURS_OPEN = 2 * (a.adxScale || 1.0);
+    const MAX_HOURS_OPEN = 2 * (a.adxScale || 1.0) * (config.timeLimitMultiplier || 1.0);
     const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
     const MIN_ACTIVATION_PCT = 0.006;
     const TRAIL_DISTANCE_ATR = 1.0;
@@ -2571,7 +2571,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original' } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0 } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2583,10 +2583,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

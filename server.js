@@ -2325,20 +2325,23 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
         if (c.high >= sl) { exitPrice = sl; reason = trailingActive ? 'SL Auto (trailing)' : 'SL Auto'; break; }
       }
 
-      // Trailing stop
-      if (signal === 'COMPRAR') {
-        if (c.high > peakPrice) peakPrice = c.high;
-        const favorableMove = peakPrice - entry;
-        if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
-          const candidateSl = Math.max(entry, peakPrice - atr * TRAIL_DISTANCE_ATR);
-          if (candidateSl > sl) { sl = candidateSl; trailingActive = true; }
-        }
-      } else {
-        if (c.low < peakPrice) peakPrice = c.low;
-        const favorableMove = entry - peakPrice;
-        if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
-          const candidateSl = Math.min(entry, peakPrice + atr * TRAIL_DISTANCE_ATR);
-          if (candidateSl < sl) { sl = candidateSl; trailingActive = true; }
+      // Trailing stop (se puede desactivar con config.disableTrailing, para
+      // aislar si es esto o el límite de tiempo lo que corta antes de tiempo)
+      if (!config.disableTrailing) {
+        if (signal === 'COMPRAR') {
+          if (c.high > peakPrice) peakPrice = c.high;
+          const favorableMove = peakPrice - entry;
+          if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
+            const candidateSl = Math.max(entry, peakPrice - atr * TRAIL_DISTANCE_ATR);
+            if (candidateSl > sl) { sl = candidateSl; trailingActive = true; }
+          }
+        } else {
+          if (c.low < peakPrice) peakPrice = c.low;
+          const favorableMove = entry - peakPrice;
+          if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
+            const candidateSl = Math.min(entry, peakPrice + atr * TRAIL_DISTANCE_ATR);
+            if (candidateSl < sl) { sl = candidateSl; trailingActive = true; }
+          }
         }
       }
 
@@ -2671,7 +2674,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default' } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2683,10 +2686,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

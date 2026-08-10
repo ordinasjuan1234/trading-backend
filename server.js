@@ -744,6 +744,55 @@ function analyzeTrendFollowAdx(closes, highs, lows) {
   return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
 }
 
+// Variante experimental (10/8/2026) — misma entrada que analyzeTrendFollowAdx,
+// pero SIN el estirón de 1.3x cuando el ADX es fuerte (solo mantiene el
+// achique a 0.7x cuando es débil). Hipótesis: el backtest realista mostró que
+// ni dándole 5x más tiempo el TP se llega a tocar — puede que el objetivo
+// esté pedido demasiado lejos, no que le falte paciencia. Esto prueba un
+// objetivo más conservador (nunca más lejos que el base, a veces más cerca).
+function analyzeTrendFollowAdxCapped(closes, highs, lows) {
+  if (!closes || closes.length < 60) return null;
+  const price = closes[closes.length - 1];
+  const ema20Now = calcEMA(closes, 20);
+  const ema20Before = calcEMA(closes.slice(0, -5), 20);
+  const ema50Now = calcEMA(closes, 50);
+  const ema50Before = calcEMA(closes.slice(0, -5), 50);
+  if (!ema20Now || !ema50Now || !ema20Before || !ema50Before) return null;
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (price > ema20Now) bull += 1; else bear += 1;
+  if (price > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema20Before) bull += 2; else if (ema20Now < ema20Before) bear += 2;
+  if (ema50Now > ema50Before) bull += 1; else if (ema50Now < ema50Before) bear += 1;
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal === null || adxVal >= 20;
+  if (diff >= 4 && isVolatileEnough && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+  }
+  let entry = price, tp, sl;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const baseTp = state.tpAtrMultiplier || 3.0;
+  let adxScale = 1.0;
+  if (adxVal !== null && adxVal < 25) adxScale = 0.7; // solo achica, nunca estira
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale * adxScale, tpMultiplier = baseTp * vol.multiplierScale * adxScale;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
+}
+
 // Variante experimental (5/8/2026) — misma entrada que analyzeTrendFollowAdx
 // (EMA/ADX/nube, y el mismo escalado por ADX ya validado), pero con la
 // relación SL/TP INVERTIDA: en vez de arriesgar poco para ganar mucho (R:R
@@ -2198,7 +2247,8 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
     const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
 
-    const a = analyzeTrendFollowAdx(closes, highs, lows);
+    const analyzeFnRealistic = config.tpVariant === 'capped' ? analyzeTrendFollowAdxCapped : analyzeTrendFollowAdx;
+    const a = analyzeFnRealistic(closes, highs, lows);
     if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;
 
     // Simular la vida de esta operación paso a paso en velas de 15m, igual
@@ -2571,7 +2621,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0 } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default' } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2583,10 +2633,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

@@ -2158,6 +2158,145 @@ async function runTendenciaWithCounterBacktest(pair, tf, days, config) {
   };
 }
 
+// Backtest "realista" de Tendencia-ADX (10/8/2026) — a diferencia de todos los
+// backtests anteriores (que solo chequean TP/SL con paciencia infinita), este
+// simula los DOS mecanismos que existen SOLO en vivo: el trailing stop
+// (activa a 0.6%, sigue al precio a 1x ATR) y el límite de tiempo escalado
+// por ADX (con el mismo criterio de "no cortar en pérdida neta salvo límite
+// duro 3x" que usa el código real). Usa velas de 15m para simular la vida de
+// la operación después de abrir (proxy razonable del chequeo real de 1m).
+async function runTendenciaRealisticBacktest(pair, tf, days, config) {
+  const { minConfidence, riskPct, initialCapital } = config;
+  const COMMISSION_PCT = 0.001;
+  const shortTf = '15m';
+
+  const [candlesMain, candlesShort] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000),
+    fetchHistoricalCandlesWithVolume(pair, shortTf, days, Math.min(Math.ceil(days * 96) + 100, 20000))
+  ]);
+
+  let pShort = 0;
+  function windowUpTo(arr, ptrStart, targetTime, maxLen) {
+    let i = ptrStart;
+    while (i < arr.length - 1 && arr[i + 1].time <= targetTime) i++;
+    const start = Math.max(0, i - maxLen + 1);
+    return { slice: arr.slice(start, i + 1), newPtr: i };
+  }
+  function idxAtOrAfter(arr, fromIdx, targetTime) {
+    let i = fromIdx;
+    while (i < arr.length && arr[i].time < targetTime) i++;
+    return i;
+  }
+
+  let capital = initialCapital, trades = [], peakCapital = initialCapital, maxDrawdown = 0;
+  let closedByReason = {};
+  const MIN_HISTORY = 70;
+  const tfHours = { '15m': 0.25, '30m': 0.5, '1h': 1, '4h': 4 }[tf] || 4;
+
+  for (let i = MIN_HISTORY; i < candlesMain.length; i++) {
+    const current = candlesMain[i];
+    const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
+    const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
+
+    const a = analyzeTrendFollowAdx(closes, highs, lows);
+    if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;
+
+    // Simular la vida de esta operación paso a paso en velas de 15m, igual
+    // que el chequeo real de 1m en vivo — trailing + tiempo + TP/SL.
+    const wShortStart = windowUpTo(candlesShort, pShort, current.time, 1);
+    let sIdx = idxAtOrAfter(candlesShort, wShortStart.newPtr, current.time);
+    const entry = a.entry, tp = a.tp, sl0 = a.sl, signal = a.signal;
+    const atr = Math.abs(entry - sl0) / 1.5;
+    const size = capital * riskPct;
+    const MAX_HOURS_OPEN = 2 * (a.adxScale || 1.0);
+    const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
+    const MIN_ACTIVATION_PCT = 0.006;
+    const TRAIL_DISTANCE_ATR = 1.0;
+    const COMMISSION_ROUNDTRIP_PCT = 0.002;
+
+    let sl = sl0, peakPrice = entry, trailingActive = false;
+    let exitPrice = null, reason = null;
+    let nextMainIdx = i + 1; // avanzamos el índice principal hasta pasar el cierre
+
+    for (; sIdx < candlesShort.length; sIdx++) {
+      const c = candlesShort[sIdx];
+      const hoursOpen = (c.time - current.time) / (1000 * 60 * 60);
+
+      // TP/SL por mecha
+      if (signal === 'COMPRAR') {
+        if (c.high >= tp) { exitPrice = tp; reason = 'TP Auto'; break; }
+        if (c.low <= sl) { exitPrice = sl; reason = trailingActive ? 'SL Auto (trailing)' : 'SL Auto'; break; }
+      } else {
+        if (c.low <= tp) { exitPrice = tp; reason = 'TP Auto'; break; }
+        if (c.high >= sl) { exitPrice = sl; reason = trailingActive ? 'SL Auto (trailing)' : 'SL Auto'; break; }
+      }
+
+      // Trailing stop
+      if (signal === 'COMPRAR') {
+        if (c.high > peakPrice) peakPrice = c.high;
+        const favorableMove = peakPrice - entry;
+        if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
+          const candidateSl = Math.max(entry, peakPrice - atr * TRAIL_DISTANCE_ATR);
+          if (candidateSl > sl) { sl = candidateSl; trailingActive = true; }
+        }
+      } else {
+        if (c.low < peakPrice) peakPrice = c.low;
+        const favorableMove = entry - peakPrice;
+        if (favorableMove >= Math.max(atr, entry * MIN_ACTIVATION_PCT)) {
+          const candidateSl = Math.min(entry, peakPrice + atr * TRAIL_DISTANCE_ATR);
+          if (candidateSl < sl) { sl = candidateSl; trailingActive = true; }
+        }
+      }
+
+      // Límite de tiempo (mismo criterio que en vivo: no cortar en pérdida neta salvo límite duro)
+      if (hoursOpen >= MAX_HOURS_OPEN) {
+        const pricePct = signal === 'COMPRAR' ? (c.close - entry) / entry : (entry - c.close) / entry;
+        const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
+        const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
+        if (!inLoss || hitHardCap) {
+          exitPrice = c.close;
+          reason = hitHardCap && inLoss ? 'Cierre por tiempo (límite duro)' : 'Cierre por tiempo';
+          break;
+        }
+      }
+    }
+
+    if (exitPrice === null) continue; // se quedó sin datos antes de resolver, se descarta
+
+    const pricePct = signal === 'COMPRAR' ? (exitPrice - entry) / entry : (entry - exitPrice) / entry;
+    const grossPnl = size * pricePct;
+    const commission = size * COMMISSION_PCT * 2;
+    const pnl = grossPnl - commission;
+    capital += pnl;
+    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason });
+    closedByReason[reason] = (closedByReason[reason] || 0) + 1;
+    if (capital > peakCapital) peakCapital = capital;
+    const dd = (peakCapital - capital) / peakCapital;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+
+    // Avanzar el índice principal hasta pasar el momento de cierre, para no reabrir en el mismo hueco
+    while (nextMainIdx < candlesMain.length && candlesMain[nextMainIdx].time < candlesShort[sIdx].time) nextMainIdx++;
+    i = nextMainIdx - 1; // el for principal hace i++ después
+    pShort = sIdx;
+  }
+
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const totalPnl = capital - initialCapital;
+  return {
+    trades: trades.length, wins, losses,
+    winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: trades.reduce((s, t) => s + t.grossPnl, 0).toFixed(2),
+    totalCommission: trades.reduce((s, t) => s + t.commission, 0).toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    closedByReason,
+    candlesUsed: { main: candlesMain.length, short: candlesShort.length }
+  };
+}
+
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001;
@@ -2440,6 +2579,15 @@ app.post("/backtest", async (req, res) => {
         success: true,
         config: { pair, days, minConfidence, riskPct, initialCapital, strategy },
         dataRange: { note: 'multi-timeframe (5m/1m/15m) — ver candlesUsed en el resultado' },
+        result
+      });
+    }
+    if (strategy === 'tendencia-realistic') {
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital });
+      return res.json({
+        success: true,
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy },
+        dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });
     }

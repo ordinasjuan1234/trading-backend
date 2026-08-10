@@ -793,9 +793,51 @@ function analyzeTrendFollowAdxCapped(closes, highs, lows) {
   return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
 }
 
-// Variante experimental (5/8/2026) — misma entrada que analyzeTrendFollowAdx
-// (EMA/ADX/nube, y el mismo escalado por ADX ya validado), pero con la
-// relación SL/TP INVERTIDA: en vez de arriesgar poco para ganar mucho (R:R
+// Variante experimental (10/8/2026) — misma entrada, pero con la base del TP
+// reducida a la mitad (1.5x ATR en vez de 3x) y SIN escalado por ADX (para
+// aislar el efecto de una sola variable: ¿el problema es que el objetivo de
+// base ya es demasiado ambicioso, más allá de cualquier ajuste por ADX?).
+// R:R se mantiene fijo en 2:1.
+function analyzeTrendFollowSmallTp(closes, highs, lows) {
+  if (!closes || closes.length < 60) return null;
+  const price = closes[closes.length - 1];
+  const ema20Now = calcEMA(closes, 20);
+  const ema20Before = calcEMA(closes.slice(0, -5), 20);
+  const ema50Now = calcEMA(closes, 50);
+  const ema50Before = calcEMA(closes.slice(0, -5), 50);
+  if (!ema20Now || !ema50Now || !ema20Before || !ema50Before) return null;
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (price > ema20Now) bull += 1; else bear += 1;
+  if (price > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema20Before) bull += 2; else if (ema20Now < ema20Before) bear += 2;
+  if (ema50Now > ema50Before) bull += 1; else if (ema50Now < ema50Before) bear += 1;
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal === null || adxVal >= 20;
+  if (diff >= 4 && isVolatileEnough && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+  }
+  let entry = price, tp, sl;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const baseTp = 1.5; // fijo, mitad del original (3.0), sin escalado por ADX
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale, tpMultiplier = baseTp * vol.multiplierScale;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr2 = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr: rr2, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale: 1.0 };
+}
 // 2:1), acá se arriesga más para ganar menos (R:R 1:2 — SL el doble de
 // lejos que el TP). Necesita mucho más win rate para ser rentable; se prueba
 // para comparar contra la convención "SL corto / TP largo" que ya funciona.
@@ -2247,7 +2289,9 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
     const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
 
-    const analyzeFnRealistic = config.tpVariant === 'capped' ? analyzeTrendFollowAdxCapped : analyzeTrendFollowAdx;
+    const analyzeFnRealistic = config.tpVariant === 'capped' ? analyzeTrendFollowAdxCapped
+      : config.tpVariant === 'small' ? analyzeTrendFollowSmallTp
+      : analyzeTrendFollowAdx;
     const a = analyzeFnRealistic(closes, highs, lows);
     if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;
 

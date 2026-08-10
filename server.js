@@ -2318,7 +2318,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     const commission = size * COMMISSION_PCT * 2;
     const pnl = grossPnl - commission;
     capital += pnl;
-    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason });
+    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, adx: a.adx, adxScale: a.adxScale });
     closedByReason[reason] = (closedByReason[reason] || 0) + 1;
     if (capital > peakCapital) peakCapital = capital;
     const dd = (peakCapital - capital) / peakCapital;
@@ -2333,6 +2333,11 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   const wins = trades.filter(t => t.pnl > 0).length;
   const losses = trades.filter(t => t.pnl < 0).length;
   const totalPnl = capital - initialCapital;
+  const adxScaleCount = {};
+  for (const t of trades) {
+    const k = (t.adxScale || 1.0).toString();
+    adxScaleCount[k] = (adxScaleCount[k] || 0) + 1;
+  }
   return {
     trades: trades.length, wins, losses,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
@@ -2343,6 +2348,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
     maxDrawdown: (maxDrawdown * 100).toFixed(2),
     closedByReason,
+    adxScaleDistribution: adxScaleCount,
     candlesUsed: { main: candlesMain.length, short: candlesShort.length }
   };
 }

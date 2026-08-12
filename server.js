@@ -2281,6 +2281,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
 
   let capital = initialCapital, trades = [], peakCapital = initialCapital, maxDrawdown = 0;
   let closedByReason = {};
+  let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0;
   const MIN_HISTORY = 70;
   const tfHours = { '15m': 0.25, '30m': 0.5, '1h': 1, '4h': 4 }[tf] || 4;
 
@@ -2294,12 +2295,13 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
       : analyzeTrendFollowAdx;
     const a = analyzeFnRealistic(closes, highs, lows);
     if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;
+    signalsSeenBeforeFilter++;
     // Mismo filtro de comisión mínima que ya corre en vivo para Tendencia
     // (openTrade(), MIN_EDGE_STRATEGIES) — el backtest realista no lo tenía,
     // por eso la comisión se comía el bruto positivo con 83 operaciones.
     if (config.applyMinEdgeFilter !== false) {
       const projectedMovePct = Math.abs(a.tp - a.entry) / a.entry;
-      if (projectedMovePct < 0.006) continue;
+      if (projectedMovePct < 0.006) { signalsSkippedByEdgeFilter++; continue; }
     }
 
     // Simular la vida de esta operación paso a paso en velas de 15m, igual
@@ -2426,6 +2428,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
     maxDrawdown: (maxDrawdown * 100).toFixed(2),
     closedByReason,
     adxScaleDistribution: adxScaleCount,
+    edgeFilterCheck: { signalsSeenBeforeFilter, signalsSkippedByEdgeFilter, filterActive: config.applyMinEdgeFilter !== false },
     candlesUsed: { main: candlesMain.length, short: candlesShort.length }
   };
 }

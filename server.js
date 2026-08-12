@@ -2325,6 +2325,27 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
         if (c.high >= sl) { exitPrice = sl; reason = trailingActive ? 'SL Auto (trailing)' : 'SL Auto'; break; }
       }
 
+      // Breakeven temprano (config.earlyBreakeven) — a diferencia del trailing
+      // normal (que recién actúa con 0.6% de ganancia real), esto mueve el SL
+      // a punto de equilibrio (ni gana ni pierde, solo paga comisión) apenas
+      // el precio se mueve un poco a favor — mucho antes. Ataca directo el
+      // patrón real que confirmamos con datos: pérdidas completas y frecuentes,
+      // ganancias chicas y raras. No reemplaza el trailing, corre antes.
+      if (config.earlyBreakeven) {
+        const BREAKEVEN_TRIGGER_ATR = 0.4; // bastante antes del 1.0 ATR del trailing normal
+        if (signal === 'COMPRAR') {
+          const favorableMove = c.high - entry;
+          if (favorableMove >= atr * BREAKEVEN_TRIGGER_ATR && sl < entry) {
+            sl = entry; // breakeven — de acá en más, esta operación no puede perder más que la comisión
+          }
+        } else {
+          const favorableMove = entry - c.low;
+          if (favorableMove >= atr * BREAKEVEN_TRIGGER_ATR && sl > entry) {
+            sl = entry;
+          }
+        }
+      }
+
       // Trailing stop (se puede desactivar con config.disableTrailing, para
       // aislar si es esto o el límite de tiempo lo que corta antes de tiempo)
       if (!config.disableTrailing) {
@@ -2676,7 +2697,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2688,10 +2709,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

@@ -2294,6 +2294,13 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
       : analyzeTrendFollowAdx;
     const a = analyzeFnRealistic(closes, highs, lows);
     if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;
+    // Mismo filtro de comisión mínima que ya corre en vivo para Tendencia
+    // (openTrade(), MIN_EDGE_STRATEGIES) — el backtest realista no lo tenía,
+    // por eso la comisión se comía el bruto positivo con 83 operaciones.
+    if (config.applyMinEdgeFilter !== false) {
+      const projectedMovePct = Math.abs(a.tp - a.entry) / a.entry;
+      if (projectedMovePct < 0.006) continue;
+    }
 
     // Simular la vida de esta operación paso a paso en velas de 15m, igual
     // que el chequeo real de 1m en vivo — trailing + tiempo + TP/SL.

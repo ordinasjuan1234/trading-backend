@@ -2345,8 +2345,10 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
         }
       }
 
-      // Límite de tiempo (mismo criterio que en vivo: no cortar en pérdida neta salvo límite duro)
-      if (hoursOpen >= MAX_HOURS_OPEN) {
+      // Límite de tiempo (mismo criterio que en vivo: no cortar en pérdida neta
+      // salvo límite duro) — se puede desactivar del todo con config.noTimeLimit,
+      // dejando que la operación corra hasta TP o SL sin importar cuánto tarde.
+      if (!config.noTimeLimit && hoursOpen >= MAX_HOURS_OPEN) {
         const pricePct = signal === 'COMPRAR' ? (c.close - entry) / entry : (entry - c.close) / entry;
         const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
         const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
@@ -2674,7 +2676,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2686,10 +2688,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

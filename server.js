@@ -1708,10 +1708,11 @@ async function runAutoCheckInner() {
         // que llegaba a tardar Tendencia en 1h/4h.
         // const a = analyzeImproved(closes, highs, lows);
         // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        // Tendencia con TP/SL escalado por ADX (5/8/2026) — backtest de 180
-        // días mostró +11,96% neto vs +2,16% de la versión anterior (mismo
-        // riesgo, drawdown casi igual). Reemplaza a analyzeTrendFollow().
-        const b = analyzeTrendFollowAdx(closes, highs, lows);
+        // Tendencia con ADX≥25 (11/8/2026) — backtest de 60 días con
+        // breakeven+trailing ajustado mostró 67,9% de aciertos y neto de
+        // -$2,76 (casi punto de equilibrio, contra -$24,26 con ADX≥20).
+        // Reemplaza a analyzeTrendFollowAdx().
+        const b = analyzeTrendFollowAdx25(closes, highs, lows);
         if (b && b.signal !== 'NEUTRO') {
           const goodEntry = await checkGoodEntry15m(pair, b.direction);
           if (goodEntry) {
@@ -1840,7 +1841,7 @@ app.get("/debug/signals", async (req, res) => {
       const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
       const a = analyzeImproved(closes, highs, lows);
       if (a) results.push({ tf, strategy: 'Reversión', signal: a.signal, confidence: a.confidence, ...withDistances(a) });
-      const b = analyzeTrendFollowAdx(closes, highs, lows);
+      const b = analyzeTrendFollowAdx25(closes, highs, lows);
       if (b) results.push({ tf, strategy: 'Tendencia', signal: b.signal, confidence: b.confidence, ...withDistances(b) });
     }
     const { closes: closes15, highs: highs15, lows: lows15 } = await fetchKlines(pair, '15m', 60);

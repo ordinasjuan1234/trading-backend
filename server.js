@@ -841,6 +841,56 @@ function analyzeTrendFollowSmallTp(closes, highs, lows) {
 // 2:1), acá se arriesga más para ganar menos (R:R 1:2 — SL el doble de
 // lejos que el TP). Necesita mucho más win rate para ser rentable; se prueba
 // para comparar contra la convención "SL corto / TP largo" que ya funciona.
+// Variante experimental (11/8/2026) — misma lógica que analyzeTrendFollowAdx,
+// pero exige ADX≥25 para confirmar tendencia (en vez de ≥20). Menos señales,
+// pero solo las que ya vienen con más fuerza real — probando si eso ayuda a
+// que la comisión pese menos al operar con menos frecuencia.
+function analyzeTrendFollowAdx25(closes, highs, lows) {
+  if (!closes || closes.length < 60) return null;
+  const price = closes[closes.length - 1];
+  const ema20Now = calcEMA(closes, 20);
+  const ema20Before = calcEMA(closes.slice(0, -5), 20);
+  const ema50Now = calcEMA(closes, 50);
+  const ema50Before = calcEMA(closes.slice(0, -5), 50);
+  if (!ema20Now || !ema50Now || !ema20Before || !ema50Before) return null;
+  const volRank = calcVolatilityRank(closes);
+  const isVolatileEnough = volRank > 0.3;
+  const atr = calcATR(highs, lows, closes) || price * 0.02;
+  let bull = 0, bear = 0;
+  if (price > ema20Now) bull += 1; else bear += 1;
+  if (price > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema50Now) bull += 1; else bear += 1;
+  if (ema20Now > ema20Before) bull += 2; else if (ema20Now < ema20Before) bear += 2;
+  if (ema50Now > ema50Before) bull += 1; else if (ema50Now < ema50Before) bear += 1;
+  const total = bull + bear;
+  const conf = total > 0 ? Math.round((Math.max(bull, bear) / total) * 100) : 50;
+  const diff = bull - bear;
+  let signal = 'NEUTRO', direction = 'ESPERAR';
+  const adxVal = calcADX(highs, lows, closes);
+  const trendConfirmed = adxVal !== null && adxVal >= 25; // más exigente que el original (20)
+  if (diff >= 4 && isVolatileEnough && trendConfirmed) { signal = 'COMPRAR'; direction = 'LARGO'; }
+  else if (diff <= -4 && isVolatileEnough && trendConfirmed) { signal = 'VENDER'; direction = 'SHORT'; }
+  const cloud = calcIchimokuCloud(highs, lows, closes);
+  if (cloud) {
+    if (signal === 'COMPRAR' && !cloud.aboveCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+    if (signal === 'VENDER' && !cloud.belowCloud) { signal = 'NEUTRO'; direction = 'ESPERAR'; }
+  }
+  let entry = price, tp, sl;
+  const vol = calcVolatilityRegime(highs, lows, closes);
+  const baseTp = state.tpAtrMultiplier || 3.0;
+  let adxScale = 1.0;
+  if (adxVal !== null) {
+    if (adxVal >= 35) adxScale = 1.3;
+    else if (adxVal < 25) adxScale = 0.7; // no debería darse nunca acá, por las dudas
+  }
+  const slMultiplier = (baseTp / 2) * vol.multiplierScale * adxScale, tpMultiplier = baseTp * vol.multiplierScale * adxScale;
+  if (signal === 'COMPRAR') { sl = price - atr * slMultiplier; tp = price + atr * tpMultiplier; }
+  else if (signal === 'VENDER') { sl = price + atr * slMultiplier; tp = price - atr * tpMultiplier; }
+  else { sl = price - atr; tp = price + atr; }
+  const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+  return { signal, direction, confidence: conf, price, entry, tp, sl, rr, strategy: 'Tendencia', atr, cloud, volRegime: vol.regime, adx: adxVal, adxScale };
+}
+
 function analyzeTrendFollowInvertedRR(closes, highs, lows) {
   if (!closes || closes.length < 60) return null;
   const price = closes[closes.length - 1];
@@ -1375,7 +1425,33 @@ async function runAutoCheckInner() {
       // costo de operar, y cualquier retroceso chico ya deja pérdida neta.
       const MIN_ACTIVATION_PCT = 0.006; // 0.6% — 3x la comisión de 0.2%
       const activationDistance = Math.max(atr * ACTIVATION_ATR, t.entry * MIN_ACTIVATION_PCT);
-      const TRAIL_DISTANCE_ATR = 1.0; // el SL persigue el precio a 1x ATR de distancia del mejor precio alcanzado
+      // Tendencia (11/8/2026): validado por backtest de 60 días — trailing más
+      // ajustado (0.6x en vez de 1x) protege más de la ganancia una vez activo.
+      // El resto de las estrategias sigue con 1x, no se probó ahí todavía.
+      const TRAIL_DISTANCE_ATR = t.strategy === 'Tendencia' ? 0.6 : 1.0;
+
+      // Breakeven temprano, SOLO Tendencia (11/8/2026) — validado por backtest:
+      // mueve el SL a punto de equilibrio (ni gana ni pierde, solo comisión) apenas
+      // el precio se mueve 0.8x ATR a favor — bastante antes de la activación
+      // completa del trailing de arriba. Ataca el patrón real que confirmamos con
+      // datos: pérdidas completas y frecuentes, ganancias chicas y raras.
+      if (t.strategy === 'Tendencia') {
+        const BREAKEVEN_TRIGGER_ATR = 0.8;
+        if (t.signal === 'COMPRAR') {
+          const favorableMoveBE = recentHigh - t.entry;
+          if (favorableMoveBE >= atr * BREAKEVEN_TRIGGER_ATR && t.sl < t.entry) {
+            t.sl = t.entry;
+            await saveState(state);
+          }
+        } else if (t.signal === 'VENDER') {
+          const favorableMoveBE = t.entry - recentLow;
+          if (favorableMoveBE >= atr * BREAKEVEN_TRIGGER_ATR && t.sl > t.entry) {
+            t.sl = t.entry;
+            await saveState(state);
+          }
+        }
+      }
+
       if (t.signal === 'COMPRAR') {
         if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
@@ -2292,6 +2368,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
 
     const analyzeFnRealistic = config.tpVariant === 'capped' ? analyzeTrendFollowAdxCapped
       : config.tpVariant === 'small' ? analyzeTrendFollowSmallTp
+      : config.tpVariant === 'adx25' ? analyzeTrendFollowAdx25
       : analyzeTrendFollowAdx;
     const a = analyzeFnRealistic(closes, highs, lows);
     if (!a || a.signal === 'NEUTRO' || a.confidence < minConfidence) continue;

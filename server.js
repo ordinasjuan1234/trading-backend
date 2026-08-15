@@ -1412,8 +1412,24 @@ async function runAutoCheckInner() {
       // igual que lo haría una orden real de TP/SL puesta en el exchange.
       const { closes, highs, lows } = await fetchKlines(t.pair, "1m", 3);
       const currentPrice = closes[closes.length - 1];
-      const recentHigh = Math.max(...highs);
-      const recentLow = Math.min(...lows);
+      let recentHigh = Math.max(...highs);
+      let recentLow = Math.min(...lows);
+
+      // Tendencia (1h/4h) se validó por backtest contra velas de 15m, no 1m —
+      // chequear breakeven/trailing/TP/SL cada 60s contra la mecha de 1 minuto
+      // reacciona a ruido que el backtest nunca vio, y corta en breakeven apenas
+      // el precio hace un vaivén normal (ver diagnóstico 14/8: 3 operaciones
+      // cerradas con entrada = salida exacta, solo pagando comisión). Acá usamos
+      // la mecha real de 15m para esta estrategia, igual que el Sub-SL ya hace.
+      if (t.strategy === 'Tendencia') {
+        try {
+          const { highs: highs15m, lows: lows15m } = await fetchKlines(t.pair, '15m', 2);
+          recentHigh = Math.max(...highs15m);
+          recentLow = Math.min(...lows15m);
+        } catch (e) {
+          console.log('15m check fetch error (Tendencia), usando 1m como fallback:', e.message);
+        }
+      }
 
       // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
       // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.

@@ -845,6 +845,64 @@ function analyzeTrendFollowSmallTp(closes, highs, lows) {
 // pero exige ADX≥25 para confirmar tendencia (en vez de ≥20). Menos señales,
 // pero solo las que ya vienen con más fuerza real — probando si eso ayuda a
 // que la comisión pese menos al operar con menos frecuencia.
+// ── Estructura de mercado (12/8/2026) — detección de swings SIN lookahead:
+// un candle solo se confirma como swing high/low después de que pasaron
+// `confirmBars` velas adicionales (igual que lo haría un trader mirando el
+// gráfico en tiempo real, nunca sabe que es un swing hasta que ya pasó).
+// closes/highs/lows deben venir SOLO hasta el índice actual del backtest —
+// no se les pasa nada del futuro.
+function detectConfirmedSwings(highs, lows, lookback = 3, confirmBars = 3) {
+  const n = highs.length;
+  const swingHighs = [], swingLows = [];
+  // Recorre hasta n - confirmBars - 1: el último candle evaluable es el que
+  // ya tiene `confirmBars` velas después para confirmar que fue un pico/valle real.
+  for (let i = lookback; i < n - confirmBars; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = i - lookback; j <= i + confirmBars; j++) {
+      if (j === i) continue;
+      if (highs[j] >= highs[i]) isHigh = false;
+      if (lows[j] <= lows[i]) isLow = false;
+    }
+    if (isHigh) swingHighs.push({ idx: i, price: highs[i] });
+    if (isLow) swingLows.push({ idx: i, price: lows[i] });
+  }
+  return { swingHighs, swingLows };
+}
+
+// Clasifica estructura con los últimos 2 swings confirmados de cada tipo:
+// HH+HL = alcista, LH+LL = bajista, cualquier otra combinación = sin estructura clara (rango).
+function classifyStructure(swingHighs, swingLows) {
+  if (swingHighs.length < 2 || swingLows.length < 2) return 'sin_datos';
+  const lastHigh = swingHighs[swingHighs.length - 1], prevHigh = swingHighs[swingHighs.length - 2];
+  const lastLow = swingLows[swingLows.length - 1], prevLow = swingLows[swingLows.length - 2];
+  const higherHigh = lastHigh.price > prevHigh.price;
+  const higherLow = lastLow.price > prevLow.price;
+  const lowerHigh = lastHigh.price < prevHigh.price;
+  const lowerLow = lastLow.price < prevLow.price;
+  if (higherHigh && higherLow) return 'alcista';
+  if (lowerHigh && lowerLow) return 'bajista';
+  return 'rango';
+}
+
+// Filtro de espacio: ¿hay lugar real hasta el próximo obstáculo estructural
+// antes de llegar al TP? Exige que la distancia libre sea al menos 2x la
+// distancia al SL (mismo criterio que el ejemplo que diste).
+function checkStructuralSpace(entry, slDistance, direction, swingHighs, swingLows) {
+  if (direction === 'LARGO') {
+    const obstaclesAbove = swingHighs.filter(s => s.price > entry).map(s => s.price);
+    if (obstaclesAbove.length === 0) return { hasSpace: true, distanceToObstacle: null };
+    const nearestResistance = Math.min(...obstaclesAbove);
+    const freeSpace = nearestResistance - entry;
+    return { hasSpace: freeSpace >= slDistance * 2, distanceToObstacle: freeSpace };
+  } else {
+    const obstaclesBelow = swingLows.filter(s => s.price < entry).map(s => s.price);
+    if (obstaclesBelow.length === 0) return { hasSpace: true, distanceToObstacle: null };
+    const nearestSupport = Math.max(...obstaclesBelow);
+    const freeSpace = entry - nearestSupport;
+    return { hasSpace: freeSpace >= slDistance * 2, distanceToObstacle: freeSpace };
+  }
+}
+
 function analyzeTrendFollowAdx25(closes, highs, lows) {
   if (!closes || closes.length < 60) return null;
   const price = closes[closes.length - 1];
@@ -1412,24 +1470,8 @@ async function runAutoCheckInner() {
       // igual que lo haría una orden real de TP/SL puesta en el exchange.
       const { closes, highs, lows } = await fetchKlines(t.pair, "1m", 3);
       const currentPrice = closes[closes.length - 1];
-      let recentHigh = Math.max(...highs);
-      let recentLow = Math.min(...lows);
-
-      // Tendencia (1h/4h) se validó por backtest contra velas de 15m, no 1m —
-      // chequear breakeven/trailing/TP/SL cada 60s contra la mecha de 1 minuto
-      // reacciona a ruido que el backtest nunca vio, y corta en breakeven apenas
-      // el precio hace un vaivén normal (ver diagnóstico 14/8: 3 operaciones
-      // cerradas con entrada = salida exacta, solo pagando comisión). Acá usamos
-      // la mecha real de 15m para esta estrategia, igual que el Sub-SL ya hace.
-      if (t.strategy === 'Tendencia') {
-        try {
-          const { highs: highs15m, lows: lows15m } = await fetchKlines(t.pair, '15m', 2);
-          recentHigh = Math.max(...highs15m);
-          recentLow = Math.min(...lows15m);
-        } catch (e) {
-          console.log('15m check fetch error (Tendencia), usando 1m como fallback:', e.message);
-        }
-      }
+      const recentHigh = Math.max(...highs);
+      const recentLow = Math.min(...lows);
 
       // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
       // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.
@@ -2398,6 +2440,20 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
       if (projectedMovePct < 0.006) { signalsSkippedByEdgeFilter++; continue; }
     }
 
+    // Filtro estructural (variante C, 12/8/2026) — exige HH+HL (o LH+LL)
+    // confirmados en la MISMA ventana ya usada para la señal (sin datos
+    // extra ni futuros) y espacio libre ≥2x la distancia al SL antes del
+    // próximo swing en contra. Se activa con config.requireStructure.
+    if (config.requireStructure) {
+      const { swingHighs, swingLows } = detectConfirmedSwings(highs, lows, 3, 3);
+      const structure = classifyStructure(swingHighs, swingLows);
+      const structureOk = (a.signal === 'COMPRAR' && structure === 'alcista') || (a.signal === 'VENDER' && structure === 'bajista');
+      if (!structureOk) { if(!closedByReason['_structFail']) closedByReason['_structFail']=0; closedByReason['_structFail']++; continue; }
+      const slDist = Math.abs(a.entry - a.sl);
+      const space = checkStructuralSpace(a.entry, slDist, a.direction, swingHighs, swingLows);
+      if (!space.hasSpace) { if(!closedByReason['_spaceFail']) closedByReason['_spaceFail']=0; closedByReason['_spaceFail']++; continue; }
+    }
+
     // Simular la vida de esta operación paso a paso en velas de 15m, igual
     // que el chequeo real de 1m en vivo — trailing + tiempo + TP/SL.
     const wShortStart = windowUpTo(candlesShort, pShort, current.time, 1);
@@ -2801,7 +2857,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false } = req.body;
   try {
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
@@ -2813,10 +2869,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

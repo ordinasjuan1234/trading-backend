@@ -1488,13 +1488,13 @@ async function runAutoCheckInner() {
       // El resto de las estrategias sigue con 1x, no se probó ahí todavía.
       const TRAIL_DISTANCE_ATR = t.strategy === 'Tendencia' ? 0.6 : 1.0;
 
-      // Breakeven temprano, SOLO Tendencia (11/8/2026) — validado por backtest:
-      // mueve el SL a punto de equilibrio (ni gana ni pierde, solo comisión) apenas
-      // el precio se mueve 0.8x ATR a favor — bastante antes de la activación
-      // completa del trailing de arriba. Ataca el patrón real que confirmamos con
-      // datos: pérdidas completas y frecuentes, ganancias chicas y raras.
+      // Breakeven, SOLO Tendencia (actualizado 12/8/2026) — subido de 0.8x a
+      // 1.5x ATR: el backtest de 60 días mostró que activarlo tan temprano
+      // (0.8x) cortaba la ganancia antes de que creciera — pérdidas grandes,
+      // ganancias de centavos. Con 1.5x, el resultado se dio vuelta de
+      // -$2.76 neto a +$16.82 neto (78.5% aciertos, sobre 79 operaciones).
       if (t.strategy === 'Tendencia') {
-        const BREAKEVEN_TRIGGER_ATR = 0.8;
+        const BREAKEVEN_TRIGGER_ATR = 1.5;
         if (t.signal === 'COMPRAR') {
           const favorableMoveBE = recentHigh - t.entry;
           if (favorableMoveBE >= atr * BREAKEVEN_TRIGGER_ATR && t.sl < t.entry) {

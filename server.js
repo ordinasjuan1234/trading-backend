@@ -2753,8 +2753,15 @@ async function runScalpingRealisticBacktest(pair, days, config) {
       w15.slice.map(c => c.high), w15.slice.map(c => c.low), w15.slice.map(c => c.close)
     );
     if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
-      const size = capital * riskPct;
       const subStrategy = `Scalping-${a.regime.startsWith('Tendencia') ? 'Tendencia' : 'Lateral'}`;
+      // Mismo filtro de comisión mínima que ya corre en vivo para
+      // Scalping-Tendencia (openTrade(), MIN_EDGE_STRATEGIES) — usa el TP1,
+      // no el TP2, igual que la validación real.
+      if (config.applyMinEdgeFilter !== false && subStrategy === 'Scalping-Tendencia') {
+        const projectedMovePct = Math.abs(a.tp - a.entry) / a.entry;
+        if (projectedMovePct < 0.006) continue;
+      }
+      const size = capital * riskPct;
       openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false };
     }
   }

@@ -2661,6 +2661,121 @@ async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   };
 }
 
+// Backtest "realista" de Scalping (26/8/2026) — a diferencia del motor
+// original (que solo mira TP/SL con paciencia infinita), este simula la
+// "Salida por reversión" que en vivo es el motivo de cierre MÁS FRECUENTE
+// de Scalping-Tendencia (cruce EMA9/21 en contra en 5m) — y opcionalmente
+// un breakeven temprano, para probar si el mismo arreglo que funcionó en
+// Tendencia también corrige la asimetría pérdida-grande/ganancia-chica en Scalping.
+async function runScalpingRealisticBacktest(pair, days, config) {
+  const { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr } = config;
+  const COMMISSION_PCT = 0.001;
+
+  const [candles5, candles1, candles15] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, '5m', days, 6000),
+    fetchHistoricalCandlesWithVolume(pair, '1m', days + 0.1, 12000),
+    fetchHistoricalCandlesWithVolume(pair, '15m', days + 0.5, 2000)
+  ]);
+
+  let p1 = 0, p15 = 0;
+  function windowUpTo(arr, ptrStart, targetTime, maxLen) {
+    let i = ptrStart;
+    while (i < arr.length - 1 && arr[i + 1].time <= targetTime) i++;
+    const start = Math.max(0, i - maxLen + 1);
+    return { slice: arr.slice(start, i + 1), newPtr: i };
+  }
+
+  let capital = initialCapital, trades = [], openTrade = null, peakCapital = initialCapital, maxDrawdown = 0;
+  let closedByReason = {};
+  const MIN_5M_HISTORY = 60;
+  const BREAKEVEN_TRIGGER_ATR = breakevenTriggerAtr || 0.8;
+
+  for (let i = MIN_5M_HISTORY; i < candles5.length; i++) {
+    const current = candles5[i];
+    const window5 = candles5.slice(Math.max(0, i - MIN_5M_HISTORY), i + 1);
+    const closes5 = window5.map(c => c.close);
+
+    if (openTrade) {
+      let closed = false, exitPrice = null, reason = null;
+      if (openTrade.signal === 'COMPRAR') {
+        if (current.high >= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.low <= openTrade.sl) { exitPrice = openTrade.sl; reason = openTrade.trailingActive ? 'SL (breakeven)' : 'SL'; closed = true; }
+      } else {
+        if (current.low <= openTrade.tp) { exitPrice = openTrade.tp; reason = 'TP'; closed = true; }
+        else if (current.high >= openTrade.sl) { exitPrice = openTrade.sl; reason = openTrade.trailingActive ? 'SL (breakeven)' : 'SL'; closed = true; }
+      }
+      // Breakeven temprano — solo si todavía no se activó, y solo se aplica a
+      // Scalping-Tendencia (la rama que usa reversión, igual que en vivo).
+      if (!closed && earlyBreakeven && openTrade.subStrategy === 'Scalping-Tendencia' && !openTrade.trailingActive) {
+        const favorableMove = openTrade.signal === 'COMPRAR' ? current.high - openTrade.entry : openTrade.entry - current.high;
+        // (arriba: para VENDER, lo favorable es que el precio BAJE, así que comparamos contra current.low)
+        const fav = openTrade.signal === 'COMPRAR' ? (current.high - openTrade.entry) : (openTrade.entry - current.low);
+        if (fav >= openTrade.atr * BREAKEVEN_TRIGGER_ATR) {
+          const candidateSl = openTrade.entry;
+          if (openTrade.signal === 'COMPRAR' && candidateSl > openTrade.sl) { openTrade.sl = candidateSl; openTrade.trailingActive = true; }
+          else if (openTrade.signal === 'VENDER' && candidateSl < openTrade.sl) { openTrade.sl = candidateSl; openTrade.trailingActive = true; }
+        }
+      }
+      // Salida por reversión — SOLO Scalping-Tendencia, igual que en vivo
+      if (!closed && openTrade.subStrategy === 'Scalping-Tendencia' && closes5.length >= 22) {
+        const ema9 = calcEMA(closes5, 9), ema21 = calcEMA(closes5, 21);
+        const reversedAgainstLong = openTrade.signal === 'COMPRAR' && ema9 < ema21;
+        const reversedAgainstShort = openTrade.signal === 'VENDER' && ema9 > ema21;
+        if (reversedAgainstLong || reversedAgainstShort) {
+          exitPrice = current.close; reason = 'Salida por reversión'; closed = true;
+        }
+      }
+      if (closed) {
+        const pricePct = openTrade.signal === 'COMPRAR' ? (exitPrice - openTrade.entry) / openTrade.entry : (openTrade.entry - exitPrice) / openTrade.entry;
+        const grossPnl = openTrade.size * pricePct;
+        const commission = openTrade.size * COMMISSION_PCT * 2;
+        const pnl = grossPnl - commission;
+        capital += pnl;
+        trades.push({ ...openTrade, exitPrice, pnl, grossPnl, commission, reason, closeTime: current.time });
+        closedByReason[reason] = (closedByReason[reason] || 0) + 1;
+        openTrade = null;
+        if (capital > peakCapital) peakCapital = capital;
+        const dd = (peakCapital - capital) / peakCapital;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+      }
+      continue;
+    }
+
+    const w1 = windowUpTo(candles1, p1, current.time, 30);
+    p1 = w1.newPtr;
+    const w15 = windowUpTo(candles15, p15, current.time, 60);
+    p15 = w15.newPtr;
+    if (w1.slice.length < 20 || w15.slice.length < 20) continue;
+
+    const a = analyzeScalping(
+      closes5, window5.map(c => c.high), window5.map(c => c.low),
+      w1.slice.map(c => c.open), w1.slice.map(c => c.high), w1.slice.map(c => c.low), w1.slice.map(c => c.close), w1.slice.map(c => c.volume),
+      w15.slice.map(c => c.high), w15.slice.map(c => c.low), w15.slice.map(c => c.close)
+    );
+    if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
+      const size = capital * riskPct;
+      const subStrategy = `Scalping-${a.regime.startsWith('Tendencia') ? 'Tendencia' : 'Lateral'}`;
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false };
+    }
+  }
+
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const totalPnl = capital - initialCapital;
+  return {
+    trades: trades.length, wins, losses,
+    winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: trades.reduce((s, t) => s + t.grossPnl, 0).toFixed(2),
+    totalCommission: trades.reduce((s, t) => s + t.commission, 0).toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    closedByReason,
+    candlesUsed: { c5: candles5.length, c1: candles1.length, c15: candles15.length }
+  };
+}
+
 async function runScalpingBacktest(pair, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001; // 0.1% por lado, igual que el resto de los backtests
@@ -2859,6 +2974,15 @@ function runBacktestEngine(candles, config) {
 app.post("/backtest", async (req, res) => {
   const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false } = req.body;
   try {
+    if (strategy === 'scalping-realistic') {
+      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
+      return res.json({
+        success: true,
+        config: { pair, days, minConfidence, riskPct, initialCapital, strategy, earlyBreakeven, breakevenTriggerAtr },
+        dataRange: { note: 'Simula la salida por reversión (real, la más frecuente en vivo) + breakeven opcional — ver candlesUsed en el resultado' },
+        result
+      });
+    }
     if (strategy === 'scalping') {
       const result = await runScalpingBacktest(pair, days, { minConfidence, riskPct, initialCapital });
       return res.json({

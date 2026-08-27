@@ -1514,7 +1514,16 @@ async function runAutoCheckInner() {
         if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
         if (favorableMove >= activationDistance) {
-          const candidateSl = Math.max(t.entry, t.peakPrice - atr * TRAIL_DISTANCE_ATR);
+          // 27/8/2026: antes el piso era solo t.entry (breakeven) — el trailing
+          // podía activarse y luego, al retroceder TRAIL_DISTANCE_ATR desde el
+          // pico, terminar cerrando con una ganancia real por debajo del 0.6%
+          // (MIN_ACTIVATION_PCT) que se supone garantiza cubrir la comisión.
+          // Ahora el piso es el mismo 0.6% usado para decidir la activación,
+          // no solo "no perder" — así una ganancia "cerrada por trailing" es
+          // siempre una ganancia real, no un empate técnico que la comisión
+          // se come. No toca TRAIL_DISTANCE_ATR (0.6x, validado 11/8) ni
+          // BREAKEVEN_TRIGGER_ATR (1.5x, validado 12/8).
+          const candidateSl = Math.max(t.entry * (1 + MIN_ACTIVATION_PCT), t.peakPrice - atr * TRAIL_DISTANCE_ATR);
           if (candidateSl > t.sl) {
             const wasActive = t.trailingActive;
             t.sl = candidateSl; t.trailingActive = true;
@@ -1538,7 +1547,7 @@ async function runAutoCheckInner() {
         if (recentLow < t.peakPrice) t.peakPrice = recentLow;
         const favorableMove = t.entry - t.peakPrice;
         if (favorableMove >= activationDistance) {
-          const candidateSl = Math.min(t.entry, t.peakPrice + atr * TRAIL_DISTANCE_ATR);
+          const candidateSl = Math.min(t.entry * (1 - MIN_ACTIVATION_PCT), t.peakPrice + atr * TRAIL_DISTANCE_ATR);
           if (candidateSl < t.sl) {
             const wasActive = t.trailingActive;
             t.sl = candidateSl; t.trailingActive = true;
@@ -1808,7 +1817,17 @@ async function runAutoCheckInner() {
       const { opens: opens1, highs: highs1, lows: lows1, closes: closes1, volumes: volumes1 } = await fetchKlines(pair, '1m', 30);
       const { highs: highs15sc, lows: lows15sc, closes: closes15sc } = await fetchKlines(pair, '15m', 30);
       const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1, highs15sc, lows15sc, closes15sc);
-      if (e) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
+      // Scalping-Tendencia PAUSADA (27/8/2026) — 3 backtests distintos sobre
+      // los mismos 60 días (filtro de comisión mínima solo, minConfidence 75,
+      // confirmación de 2 velas en la salida por reversión) dieron todos
+      // bruto ~$0 o negativo y neto negativo (-$16 a -$19). El desglose por
+      // motivo de cierre mostró que las 17 ganadoras SIEMPRE fueron por TP
+      // completo y las ~31 salidas por reversión SIEMPRE perdedoras — no es
+      // un problema de timing de salida, es que la entrada revierte antes de
+      // llegar al TP con demasiada frecuencia. Mismo veredicto que Rebote:
+      // sin filo real confirmado. Scalping-Lateral sigue activo (no se tocó,
+      // no hay evidencia nueva sobre esa rama).
+      if (e && !(e.regime && e.regime.startsWith('Tendencia'))) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
     } catch (e) { console.log(`Analyze Scalping error ${pair}:`, e.message); }
     // Rebote y Scalping usan su PROPIO umbral de confianza (más bajo a propósito)
     // en vez del global — son estrategias distintas, pensadas para operar seguido

@@ -2721,8 +2721,19 @@ async function runScalpingRealisticBacktest(pair, days, config) {
         const ema9 = calcEMA(closes5, 9), ema21 = calcEMA(closes5, 21);
         const reversedAgainstLong = openTrade.signal === 'COMPRAR' && ema9 < ema21;
         const reversedAgainstShort = openTrade.signal === 'VENDER' && ema9 > ema21;
+        // 27/8/2026: antes cerraba con un solo cruce de EMA9/21 — en 5m eso
+        // puede ser ruido de una vela, no un giro real. Ahora exige que el
+        // desacuerdo se sostenga durante reversalConfirmCandles velas seguidas
+        // (default 1 = comportamiento anterior, sin cambio si no se pasa el
+        // parámetro). Objetivo: separar giros genuinos de ruido puntual.
+        const REQUIRED_CONFIRM = config.reversalConfirmCandles || 1;
         if (reversedAgainstLong || reversedAgainstShort) {
-          exitPrice = current.close; reason = 'Salida por reversión'; closed = true;
+          openTrade.reversalStreak = (openTrade.reversalStreak || 0) + 1;
+          if (openTrade.reversalStreak >= REQUIRED_CONFIRM) {
+            exitPrice = current.close; reason = 'Salida por reversión'; closed = true;
+          }
+        } else {
+          openTrade.reversalStreak = 0;
         }
       }
       if (closed) {
@@ -2762,7 +2773,7 @@ async function runScalpingRealisticBacktest(pair, days, config) {
         if (projectedMovePct < 0.006) continue;
       }
       const size = capital * riskPct;
-      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false };
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false, reversalStreak: 0 };
     }
   }
 
@@ -2982,7 +2993,7 @@ app.post("/backtest", async (req, res) => {
   const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
-      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
+      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, reversalConfirmCandles: req.body.reversalConfirmCandles });
       return res.json({
         success: true,
         config: { pair, days, minConfidence, riskPct, initialCapital, strategy, earlyBreakeven, breakevenTriggerAtr },

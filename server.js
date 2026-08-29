@@ -2503,6 +2503,40 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
         if (c.high >= sl) { exitPrice = sl; reason = trailingActive ? 'SL Auto (trailing)' : 'SL Auto'; break; }
       }
 
+      // Trailing por retroceso desde el pico (config.peakGiveback, 27/8/2026) —
+      // a diferencia del breakeven y el trailing normal (que exigen una
+      // distancia FIJA de ATR antes de reaccionar), esto mira si el precio ya
+      // devolvió una parte importante de lo más que llegó a subir/bajar a
+      // favor — sin importar si esa distancia llegó a 1x o 1.5x ATR. Ataca
+      // directo el caso real: el precio subió, no llegó al umbral del
+      // breakeven/trailing, se dio vuelta, y cerró por tiempo con centavos
+      // sin que nada intentara asegurar el pico.
+      if (config.peakGiveback && !trailingActive) {
+        const GIVEBACK_PCT = config.peakGivebackPct || 0.5;
+        const MIN_PEAK_ATR = config.peakGivebackMinAtr || 0.3;
+        if (signal === 'COMPRAR') {
+          if (c.high > peakPrice) peakPrice = c.high;
+          const peakMove = peakPrice - entry;
+          if (peakMove >= atr * MIN_PEAK_ATR) {
+            const currentMove = c.close - entry;
+            const givenBack = peakMove - currentMove;
+            if (givenBack >= peakMove * GIVEBACK_PCT && currentMove > 0) {
+              exitPrice = c.close; reason = 'Cierre por retroceso desde pico'; break;
+            }
+          }
+        } else {
+          if (c.low < peakPrice) peakPrice = c.low;
+          const peakMove = entry - peakPrice;
+          if (peakMove >= atr * MIN_PEAK_ATR) {
+            const currentMove = entry - c.close;
+            const givenBack = peakMove - currentMove;
+            if (givenBack >= peakMove * GIVEBACK_PCT && currentMove > 0) {
+              exitPrice = c.close; reason = 'Cierre por retroceso desde pico'; break;
+            }
+          }
+        }
+      }
+
       // Breakeven temprano (config.earlyBreakeven) — a diferencia del trailing
       // normal (que recién actúa con 0.6% de ganancia real), esto mueve el SL
       // a punto de equilibrio (ni gana ni pierde, solo paga comisión) apenas
@@ -2740,19 +2774,8 @@ async function runScalpingRealisticBacktest(pair, days, config) {
         const ema9 = calcEMA(closes5, 9), ema21 = calcEMA(closes5, 21);
         const reversedAgainstLong = openTrade.signal === 'COMPRAR' && ema9 < ema21;
         const reversedAgainstShort = openTrade.signal === 'VENDER' && ema9 > ema21;
-        // 27/8/2026: antes cerraba con un solo cruce de EMA9/21 — en 5m eso
-        // puede ser ruido de una vela, no un giro real. Ahora exige que el
-        // desacuerdo se sostenga durante reversalConfirmCandles velas seguidas
-        // (default 1 = comportamiento anterior, sin cambio si no se pasa el
-        // parámetro). Objetivo: separar giros genuinos de ruido puntual.
-        const REQUIRED_CONFIRM = config.reversalConfirmCandles || 1;
         if (reversedAgainstLong || reversedAgainstShort) {
-          openTrade.reversalStreak = (openTrade.reversalStreak || 0) + 1;
-          if (openTrade.reversalStreak >= REQUIRED_CONFIRM) {
-            exitPrice = current.close; reason = 'Salida por reversión'; closed = true;
-          }
-        } else {
-          openTrade.reversalStreak = 0;
+          exitPrice = current.close; reason = 'Salida por reversión'; closed = true;
         }
       }
       if (closed) {
@@ -2792,7 +2815,7 @@ async function runScalpingRealisticBacktest(pair, days, config) {
         if (projectedMovePct < 0.006) continue;
       }
       const size = capital * riskPct;
-      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false, reversalStreak: 0 };
+      openTrade = { signal: a.signal, entry: a.entry, tp: a.tp, sl: a.sl, size, openTime: current.time, confidence: a.confidence, subStrategy, atr: a.atr, trailingActive: false };
     }
   }
 
@@ -3009,10 +3032,10 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
-      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, reversalConfirmCandles: req.body.reversalConfirmCandles });
+      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
       return res.json({
         success: true,
         config: { pair, days, minConfidence, riskPct, initialCapital, strategy, earlyBreakeven, breakevenTriggerAtr },
@@ -3030,10 +3053,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

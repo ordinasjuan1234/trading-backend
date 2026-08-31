@@ -2237,7 +2237,7 @@ async function sendDailySummaryMsg() {
 // ── Backtest Engine ───────────────────────────────────────
 async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride, endTimeOverride) {
   const limit = 1000;
-  const tfMs = { '1m': 60000, '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
+  const tfMs = { '1m': 60000, '5m': 5*60000, '15m': 15*60000, '30m': 30*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
   const totalCandles = Math.min(Math.ceil((days * 86400000) / tfMs), capOverride || 5000);
   let allCandles = [];
   let endTime = endTimeOverride || Date.now();
@@ -2943,7 +2943,7 @@ async function runScalpingBacktest(pair, days, config) {
 
 async function fetchHistoricalCandles(pair, tf, days) {
   const limit = 1000;
-  const tfMs = { '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
+  const tfMs = { '5m': 5*60000, '15m': 15*60000, '30m': 30*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
   const totalCandles = Math.min(Math.ceil((days * 86400000) / tfMs), 5000); // cap for safety
   let allCandles = [];
   let endTime = Date.now();

@@ -2413,11 +2413,17 @@ async function runTendenciaWithCounterBacktest(pair, tf, days, config) {
 async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital, timeLimitMultiplier } = config;
   const COMMISSION_PCT = 0.001;
-  const shortTf = '15m';
+  // shortTf configurable (12/8→29/8): '15m' es el proxy liviano de siempre;
+  // '1m' es la nueva opción de máxima precisión, igual de fino que el chequeo
+  // real en vivo — pero mucho más pesado de traer, por eso el límite de
+  // velas se calcula distinto según cuál se pida.
+  const shortTf = config.shortTf || '15m';
+  const candlesPerDayByTf = { '1m': 1440, '5m': 288, '15m': 96, '30m': 48, '1h': 24 };
+  const shortCap = Math.min(Math.ceil(days * (candlesPerDayByTf[shortTf] || 96)) + 200, shortTf === '1m' ? 50000 : 20000);
 
   const [candlesMain, candlesShort] = await Promise.all([
     fetchHistoricalCandlesWithVolume(pair, tf, days, 2000),
-    fetchHistoricalCandlesWithVolume(pair, shortTf, days, Math.min(Math.ceil(days * 96) + 100, 20000))
+    fetchHistoricalCandlesWithVolume(pair, shortTf, days, shortCap)
   ]);
 
   let pShort = 0;
@@ -3032,7 +3038,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
       const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
@@ -3053,10 +3059,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf: shortTf || '15m' },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

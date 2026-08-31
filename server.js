@@ -1510,7 +1510,9 @@ async function runAutoCheckInner() {
         }
       }
 
-      if (t.signal === 'COMPRAR') {
+      // Manual (31/8/2026): sin trailing/breakeven automático, a propósito —
+      // el usuario ya definió su propio TP/SL, no queremos tocarlos.
+      if (t.signal === 'COMPRAR' && t.strategy !== 'Manual') {
         if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
         if (favorableMove >= activationDistance) {
@@ -1543,7 +1545,7 @@ async function runAutoCheckInner() {
             }
           }
         }
-      } else if (t.signal === 'VENDER') {
+      } else if (t.signal === 'VENDER' && t.strategy !== 'Manual') {
         if (recentLow < t.peakPrice) t.peakPrice = recentLow;
         const favorableMove = t.entry - t.peakPrice;
         if (favorableMove >= activationDistance) {
@@ -2021,6 +2023,57 @@ app.post("/state/close-trade", async (req, res) => {
     const currentPrice = closes[closes.length - 1];
     await closeTradeById(target.id, currentPrice, "Cierre Manual");
     res.json({ success: true, state });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Apertura MANUAL de operaciones (31/8/2026) — a pedido de Juan: abrir una
+// posición con TP/SL propios, usando el mismo capital real y quedando
+// vigilada por el mismo bot (Telegram, cierre automático), pero sin que la
+// haya elegido el algoritmo. A propósito NO tiene breakeven/trailing/límite
+// de tiempo automático de Tendencia — esos están afinados para las entradas
+// del algoritmo, no para el criterio manual del usuario. Se abre al precio
+// de mercado del momento, no a un precio futuro (no es una orden pendiente).
+app.post("/state/open-manual-trade", async (req, res) => {
+  const { pair, signal, tp, sl, sizePct } = req.body || {};
+  if (!pair || !signal || !tp || !sl) {
+    return res.status(400).json({ error: "Faltan datos — hacen falta: pair (ej. 'BTCUSDT'), signal ('COMPRAR' o 'VENDER'), tp, sl" });
+  }
+  if (!['COMPRAR', 'VENDER'].includes(signal)) {
+    return res.status(400).json({ error: "signal tiene que ser 'COMPRAR' o 'VENDER'" });
+  }
+  if (state.openTrades.find(t => t.pair === pair)) {
+    return res.status(400).json({ error: `Ya hay una operación abierta en ${pair} — cerrala primero si querés reemplazarla` });
+  }
+  try {
+    const { closes } = await fetchKlines(pair, "1m", 2);
+    const entry = closes[closes.length - 1];
+    // Chequeo de sentido común: el TP tiene que estar del lado correcto según
+    // la dirección, si no la operación no tendría forma de resolverse a favor.
+    if (signal === 'COMPRAR' && (tp <= entry || sl >= entry)) {
+      return res.status(400).json({ error: `Para COMPRAR, el TP (${tp}) tiene que estar arriba del precio actual (${entry.toFixed(2)}) y el SL abajo` });
+    }
+    if (signal === 'VENDER' && (tp >= entry || sl <= entry)) {
+      return res.status(400).json({ error: `Para VENDER, el TP (${tp}) tiene que estar abajo del precio actual (${entry.toFixed(2)}) y el SL arriba` });
+    }
+    const pct = sizePct || state.positionSizePct || 30;
+    const size = state.capital * (pct / 100);
+    const qty = entry > 0 ? size / entry : 0;
+    const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+    const trade = {
+      id: Date.now() + '-' + pair, pair, signal, direction: signal === 'COMPRAR' ? 'LARGO' : 'SHORT',
+      entry, tp: parseFloat(tp), sl: parseFloat(sl), qty, size, tf: 'manual',
+      strategy: 'Manual', subStrategy: null, tp2: null, adxScale: 1.0,
+      atr: Math.abs(entry - sl) / 1.5, peakPrice: entry,
+      trailingActive: false, partialTaken: false, trendDisagreeCount: 0,
+      openTime: formatArgTime(new Date()), openTimestamp: Date.now(),
+      confidence: 100, auto: false
+    };
+    state.openTrades.push(trade);
+    await saveState(state);
+    sendTelegram(`✋ OPERACIÓN MANUAL ABIERTA (Servidor)\n📊 ${pair.replace('USDT','/USDT')}\n${signal} · ${trade.direction}\n💵 Entrada: $${entry.toFixed(2)}\n🎯 TP: $${trade.tp.toFixed(2)}\n🛑 SL: $${trade.sl.toFixed(2)}\n📊 R/R: 1:${rr.toFixed(2)}\n💰 Tamaño: ${pct}% del capital\nSin breakeven/trailing automático — TP/SL fijos, tal como los pusiste.`);
+    res.json({ success: true, trade, state });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

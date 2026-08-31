@@ -1777,19 +1777,28 @@ async function runAutoCheckInner() {
         // que llegaba a tardar Tendencia en 1h/4h.
         // const a = analyzeImproved(closes, highs, lows);
         // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        // Tendencia con ADX≥25 (11/8/2026) — backtest de 60 días con
-        // breakeven+trailing ajustado mostró 67,9% de aciertos y neto de
-        // -$2,76 (casi punto de equilibrio, contra -$24,26 con ADX≥20).
-        // Reemplaza a analyzeTrendFollowAdx().
-        const b = analyzeTrendFollowAdx25(closes, highs, lows);
-        if (b && b.signal !== 'NEUTRO') {
-          const goodEntry = await checkGoodEntry15m(pair, b.direction);
-          if (goodEntry) {
-            signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-          } else {
-            console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
-          }
-        }
+        // Tendencia PAUSADA (31/8/2026) — todos los backtests anteriores
+        // (los que validaron ADX≥25, breakeven 1.5x, trailing 0.6x) corrían
+        // sin querer en 4h, no en 30m/15m que es lo que este loop realmente
+        // opera — faltaba "30m" en el mapeo de timeframes del backtest y
+        // devolvía 0 velas en silencio. Corregido el bug y repetido el
+        // backtest de 60 días YA en 30m (el timeframe real): 97 operaciones,
+        // bruto de apenas +$0.49 — sin filo direccional real, más allá de
+        // cualquier costo. Neto -$55.70 (-5.57%). Coincide con lo que se
+        // venía viendo en vivo (42-54% de aciertos, neto negativo). No se
+        // sigue operando con una entrada sin filo confirmado — la sigue
+        // vigilando el sistema por si hace falta cerrar algo abierto, pero
+        // no abre operaciones nuevas hasta rediseñar la entrada (estructura
+        // de mercado, no solo EMA+ADX+nube).
+        // const b = analyzeTrendFollowAdx25(closes, highs, lows);
+        // if (b && b.signal !== 'NEUTRO') {
+        //   const goodEntry = await checkGoodEntry15m(pair, b.direction);
+        //   if (goodEntry) {
+        //     signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
+        //   } else {
+        //     console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
+        //   }
+        // }
         // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
         // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
         // alcanza para detectar un rango operable de verdad. Queda el código

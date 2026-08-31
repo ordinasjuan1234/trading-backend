@@ -2235,12 +2235,12 @@ async function sendDailySummaryMsg() {
 }
 
 // ── Backtest Engine ───────────────────────────────────────
-async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride) {
+async function fetchHistoricalCandlesWithVolume(pair, tf, days, capOverride, endTimeOverride) {
   const limit = 1000;
   const tfMs = { '1m': 60000, '5m': 5*60000, '15m': 15*60000, '1h': 3600000, '4h': 4*3600000, '1d': 86400000 }[tf];
   const totalCandles = Math.min(Math.ceil((days * 86400000) / tfMs), capOverride || 5000);
   let allCandles = [];
-  let endTime = Date.now();
+  let endTime = endTimeOverride || Date.now();
 
   while (allCandles.length < totalCandles) {
     const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}&endTime=${endTime}`);
@@ -2420,10 +2420,16 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   const shortTf = config.shortTf || '15m';
   const candlesPerDayByTf = { '1m': 1440, '5m': 288, '15m': 96, '30m': 48, '1h': 24 };
   const shortCap = Math.min(Math.ceil(days * (candlesPerDayByTf[shortTf] || 96)) + 200, shortTf === '1m' ? 50000 : 20000);
+  // Fecha de corte específica (30/8/2026) — antes "days" siempre se contaba
+  // hacia atrás desde AHORA MISMO, así que nunca se podía backtestear un
+  // período puntual del pasado (ej: "los mismos días exactos donde el bot
+  // vino mal en vivo"). Con config.endDate ("2026-08-30" o con hora,
+  // "2026-08-30T22:00:00Z"), la ventana de "days" se ancla ahí en vez de a hoy.
+  const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
 
   const [candlesMain, candlesShort] = await Promise.all([
-    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000),
-    fetchHistoricalCandlesWithVolume(pair, shortTf, days, shortCap)
+    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000, endTimeOverride),
+    fetchHistoricalCandlesWithVolume(pair, shortTf, days, shortCap, endTimeOverride)
   ]);
 
   let pShort = 0;
@@ -3038,7 +3044,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
       const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
@@ -3059,10 +3065,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'tendencia-realistic') {
-      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf });
+      const result = await runTendenciaRealisticBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf: shortTf || '15m' },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, timeLimitMultiplier, tpVariant, disableTrailing, noTimeLimit, earlyBreakeven, breakevenTriggerAtr, trailDistanceAtr, requireStructure, peakGiveback, peakGivebackPct, peakGivebackMinAtr, shortTf: shortTf || '15m', endDate: endDate || 'ahora' },
         dataRange: { note: 'Simula trailing stop + límite de tiempo tal cual corren en vivo (' + tf + '/15m) — ver candlesUsed en el resultado' },
         result
       });

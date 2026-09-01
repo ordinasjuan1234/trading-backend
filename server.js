@@ -2480,8 +2480,15 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   // real en vivo — pero mucho más pesado de traer, por eso el límite de
   // velas se calcula distinto según cuál se pida.
   const shortTf = config.shortTf || '15m';
-  const candlesPerDayByTf = { '1m': 1440, '5m': 288, '15m': 96, '30m': 48, '1h': 24 };
+  const candlesPerDayByTf = { '1m': 1440, '5m': 288, '15m': 96, '30m': 48, '1h': 24, '4h': 6, '1d': 1 };
   const shortCap = Math.min(Math.ceil(days * (candlesPerDayByTf[shortTf] || 96)) + 200, shortTf === '1m' ? 50000 : 20000);
+  // Cap de la serie principal (1/9/2026) — antes era un 2000 fijo, que en
+  // timeframes finos (30m = 48 velas/día) se quedaba corto para ventanas
+  // largas: pedir days=180 en 30m necesita 8640 velas, pero el cap de 2000
+  // truncaba en silencio a ~41.7 días reales sin avisar — mismo patrón que
+  // el bug del mapeo de '30m' faltante (30/8), esta vez en el cap en vez
+  // del mapeo. Mismo cálculo que ya se usaba para shortCap, aplicado acá.
+  const mainCap = Math.min(Math.ceil(days * (candlesPerDayByTf[tf] || 24)) + 200, 20000);
   // Fecha de corte específica (30/8/2026) — antes "days" siempre se contaba
   // hacia atrás desde AHORA MISMO, así que nunca se podía backtestear un
   // período puntual del pasado (ej: "los mismos días exactos donde el bot
@@ -2490,7 +2497,7 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
 
   const [candlesMain, candlesShort] = await Promise.all([
-    fetchHistoricalCandlesWithVolume(pair, tf, days, 2000, endTimeOverride),
+    fetchHistoricalCandlesWithVolume(pair, tf, days, mainCap, endTimeOverride),
     fetchHistoricalCandlesWithVolume(pair, shortTf, days, shortCap, endTimeOverride)
   ]);
 

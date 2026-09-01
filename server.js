@@ -903,6 +903,72 @@ function checkStructuralSpace(entry, slDistance, direction, swingHighs, swingLow
   }
 }
 
+// Entrada nueva por estructura (1/9/2026) — reemplaza EMA20/50+ADX+Ichimoku
+// por completo, no es un filtro más encima. Idea, según el marco de auditoría
+// del 12/8 (tareas 2-5): el 4h es CONTEXTO (¿hacia dónde va el régimen
+// grande?), nunca el gatillo directo. El gatillo real es la ruptura de un
+// swing confirmado en el timeframe operativo (30m), a favor de ese régimen —
+// no un cruce de EMA ni un nivel de ADX. El SL es estructural (el swing que
+// originó la ruptura), no un múltiplo de ATR. El TP usa el filtro de espacio
+// ya construido (checkStructuralSpace): apunta al obstáculo estructural más
+// cercano, nunca más lejos de lo que hay lugar libre real.
+function analyzeStructuralEntry(closes, highs, lows, closes4h, highs4h, lows4h) {
+  if (closes.length < 40 || !closes4h || closes4h.length < 20) return null;
+
+  // 1. Régimen en 4h — contexto, nunca gatillo directo.
+  const { swingHighs: sh4h, swingLows: sl4h } = detectConfirmedSwings(highs4h, lows4h, 2, 2);
+  const regime4h = classifyStructure(sh4h, sl4h);
+  if (regime4h !== 'alcista' && regime4h !== 'bajista') {
+    return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'Sin régimen 4h claro (rango o datos insuficientes)' };
+  }
+  const wantLong = regime4h === 'alcista';
+
+  // 2. Estructura en el timeframe operativo — debe confirmar el mismo sesgo del 4h.
+  const { swingHighs, swingLows } = detectConfirmedSwings(highs, lows, 3, 3);
+  const structureLocal = classifyStructure(swingHighs, swingLows);
+  if ((wantLong && structureLocal !== 'alcista') || (!wantLong && structureLocal !== 'bajista')) {
+    return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'Estructura local no confirma el régimen 4h' };
+  }
+  if (swingHighs.length < 2 || swingLows.length < 2) return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'Swings insuficientes' };
+
+  // 3. Gatillo: ruptura del último swing confirmado en la dirección operada.
+  const lastClose = closes[closes.length - 1];
+  const lastSwingHigh = swingHighs[swingHighs.length - 1];
+  const lastSwingLow = swingLows[swingLows.length - 1];
+
+  let signal = 'NEUTRO', entry, sl, direction;
+  if (wantLong && lastClose > lastSwingHigh.price) {
+    signal = 'COMPRAR'; direction = 'LARGO'; entry = lastClose; sl = lastSwingLow.price;
+  } else if (!wantLong && lastClose < lastSwingLow.price) {
+    signal = 'VENDER'; direction = 'SHORT'; entry = lastClose; sl = lastSwingHigh.price;
+  } else {
+    return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'Esperando ruptura del swing' };
+  }
+
+  const slDist = Math.abs(entry - sl);
+  if (slDist <= 0) return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'SL inválido (swing pegado al precio)' };
+
+  // 4. Espacio hasta el próximo obstáculo estructural — reusa checkStructuralSpace tal cual.
+  const space = checkStructuralSpace(entry, slDist, direction, swingHighs, swingLows);
+  if (!space.hasSpace) return { signal: 'NEUTRO', strategy: 'Estructura', reason: 'Sin espacio suficiente hasta el próximo obstáculo' };
+
+  // TP: 90% de la distancia al obstáculo más cercano (deja margen, no apunta
+  // justo al nivel donde el precio históricamente reaccionó). Si no hay
+  // obstáculo (camino libre), 2x la distancia al SL como piso razonable.
+  const tp = space.distanceToObstacle
+    ? entry + (direction === 'LARGO' ? 1 : -1) * space.distanceToObstacle * 0.9
+    : entry + (direction === 'LARGO' ? 1 : -1) * slDist * 2;
+
+  const rr = Math.abs(tp - entry) / slDist;
+  // Sin indicador que gradúe la convicción (no hay ADX en este modelo) —
+  // confianza fija por ahora. Se podría sumar ADX/volumen como filtro
+  // adicional más adelante, pero NUNCA como gatillo, para no repetir el
+  // error de la entrada vieja.
+  const confidence = 75;
+
+  return { signal, direction, entry, tp, sl, rr, confidence, strategy: 'Estructura', atr: slDist / 1.5, regime4h };
+}
+
 function analyzeTrendFollowAdx25(closes, highs, lows) {
   if (!closes || closes.length < 60) return null;
   const price = closes[closes.length - 1];
@@ -2717,6 +2783,104 @@ async function runTendenciaRealisticBacktest(pair, tf, days, config) {
   };
 }
 
+// Motor de backtest para la entrada por estructura (1/9/2026) — walk-forward
+// sin lookahead: en cada vela de 30m, calcula swings y régimen 4h SOLO con
+// datos hasta ese momento (nunca del futuro). Deliberadamente SIN el
+// aparataje de breakeven/trailing/límite-de-tiempo de la entrada vieja —
+// esta entrada usa SL/TP estructurales fijos, para testearla en estado puro
+// antes de sumarle cualquier gestión de salida encima (evitar repetir el
+// error de afinar la salida antes de confirmar que la entrada tiene filo).
+async function runStructuralEntryBacktest(pair, tf, days, config) {
+  const { minConfidence = 0, riskPct, initialCapital } = config;
+  const COMMISSION_PCT = 0.001;
+  const candlesPerDayByTf = { '15m': 96, '30m': 48, '1h': 24, '4h': 6 };
+  const mainCap = Math.min(Math.ceil(days * (candlesPerDayByTf[tf] || 48)) + 200, 20000);
+  const cap4h = Math.min(Math.ceil(days * 6) + 100, 5000);
+  const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
+
+  const [candlesMain, candles4h] = await Promise.all([
+    fetchHistoricalCandlesWithVolume(pair, tf, days, mainCap, endTimeOverride),
+    fetchHistoricalCandlesWithVolume(pair, '4h', days, cap4h, endTimeOverride)
+  ]);
+
+  let capital = initialCapital, trades = [], peakCapital = initialCapital, maxDrawdown = 0;
+  let closedByReason = {};
+  let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0, signalsSkippedByRegime = 0;
+  const MIN_HISTORY = 60;
+  let p4h = 0;
+
+  for (let i = MIN_HISTORY; i < candlesMain.length; i++) {
+    const current = candlesMain[i];
+    const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
+    const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
+
+    // Avanzar el puntero de 4h hasta la última vela YA CERRADA al momento actual (sin lookahead).
+    while (p4h < candles4h.length - 1 && candles4h[p4h + 1].time <= current.time) p4h++;
+    if (candles4h[p4h].time > current.time || p4h < 19) continue; // todavía no hay suficiente historial 4h real
+    const window4h = candles4h.slice(Math.max(0, p4h - 40), p4h + 1);
+    const closes4h = window4h.map(c => c.close), highs4h = window4h.map(c => c.high), lows4h = window4h.map(c => c.low);
+
+    const a = analyzeStructuralEntry(closes, highs, lows, closes4h, highs4h, lows4h);
+    if (!a || a.signal === 'NEUTRO') {
+      if (a && a.reason === 'Estructura local no confirma el régimen 4h') signalsSkippedByRegime++;
+      continue;
+    }
+    if (a.confidence < minConfidence) continue;
+    signalsSeenBeforeFilter++;
+    const projectedMovePct = Math.abs(a.tp - a.entry) / a.entry;
+    if (config.applyMinEdgeFilter !== false && projectedMovePct < 0.006) { signalsSkippedByEdgeFilter++; continue; }
+
+    // Resolver la operación vela a vela en el mismo timeframe principal —
+    // SL/TP fijos, estructurales, sin trailing ni límite de tiempo (a propósito).
+    const entry = a.entry, tp = a.tp, sl = a.sl, signal = a.signal;
+    const size = capital * riskPct;
+    let exitPrice = null, reason = null;
+    const MAX_BARS = 96; // ~2 días en 30m como límite de seguridad, no de gestión activa
+    let barsOpen = 0;
+    for (let j = i + 1; j < candlesMain.length && barsOpen < MAX_BARS; j++) {
+      const c = candlesMain[j];
+      barsOpen++;
+      if (signal === 'COMPRAR') {
+        if (c.low <= sl) { exitPrice = sl; reason = 'SL estructural'; break; }
+        if (c.high >= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
+      } else {
+        if (c.high >= sl) { exitPrice = sl; reason = 'SL estructural'; break; }
+        if (c.low <= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
+      }
+      if (barsOpen === MAX_BARS - 1) { exitPrice = c.close; reason = 'Cierre por tiempo (2 días, sin resolver)'; }
+    }
+    if (exitPrice === null) continue;
+
+    const pricePct = signal === 'COMPRAR' ? (exitPrice - entry) / entry : (entry - exitPrice) / entry;
+    const grossPnl = size * pricePct;
+    const commission = size * COMMISSION_PCT * 2;
+    const pnl = grossPnl - commission;
+    capital += pnl;
+    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h });
+    closedByReason[reason] = (closedByReason[reason] || 0) + 1;
+    if (capital > peakCapital) peakCapital = capital;
+    const dd = (peakCapital - capital) / peakCapital;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+  }
+
+  const wins = trades.filter(t => t.pnl > 0).length;
+  const losses = trades.filter(t => t.pnl < 0).length;
+  const totalPnl = capital - initialCapital;
+  return {
+    trades: trades.length, wins, losses,
+    winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
+    finalCapital: capital.toFixed(2),
+    totalPnl: totalPnl.toFixed(2),
+    totalGrossPnl: trades.reduce((s, t) => s + t.grossPnl, 0).toFixed(2),
+    totalCommission: trades.reduce((s, t) => s + t.commission, 0).toFixed(2),
+    totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
+    maxDrawdown: (maxDrawdown * 100).toFixed(2),
+    closedByReason,
+    edgeFilterCheck: { signalsSeenBeforeFilter, signalsSkippedByEdgeFilter, signalsSkippedByRegime, filterActive: config.applyMinEdgeFilter !== false },
+    candlesUsed: { main: candlesMain.length, h4: candles4h.length }
+  };
+}
+
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001;
@@ -3130,6 +3294,15 @@ app.post("/backtest", async (req, res) => {
         success: true,
         config: { pair, days, minConfidence, riskPct, initialCapital, strategy },
         dataRange: { note: 'multi-timeframe (5m/1m/15m) — ver candlesUsed en el resultado' },
+        result
+      });
+    }
+    if (strategy === 'estructura-realistic') {
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate });
+      return res.json({
+        success: true,
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, endDate: endDate || 'ahora' },
+        dataRange: { note: 'Entrada nueva por estructura (régimen 4h + ruptura de swing en ' + tf + ', SL/TP estructurales fijos, sin trailing/breakeven) — ver candlesUsed en el resultado' },
         result
       });
     }

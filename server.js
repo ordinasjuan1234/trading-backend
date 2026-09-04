@@ -3100,6 +3100,11 @@ async function runScalpingRealisticBacktest(pair, days, config) {
     );
     if (a && a.signal !== 'NEUTRO' && a.confidence >= minConfidence) {
       const subStrategy = `Scalping-${a.regime.startsWith('Tendencia') ? 'Tendencia' : 'Lateral'}`;
+      // Filtro opcional (1/9/2026) para aislar una sola rama al backtestear —
+      // necesario para poder probar distintos umbrales de confianza SOLO
+      // para Lateral sin que las operaciones de Tendencia se mezclen en el
+      // resultado (antes de esto, minConfidence aplicaba a las dos por igual).
+      if (config.onlySubStrategy && subStrategy !== config.onlySubStrategy) continue;
       // Mismo filtro de comisión mínima que ya corre en vivo para
       // Scalping-Tendencia (openTrade(), MIN_EDGE_STRATEGIES) — usa el TP1,
       // no el TP2, igual que la validación real.
@@ -3115,6 +3120,19 @@ async function runScalpingRealisticBacktest(pair, days, config) {
   const wins = trades.filter(t => t.pnl > 0).length;
   const losses = trades.filter(t => t.pnl < 0).length;
   const totalPnl = capital - initialCapital;
+  // Desglose por sub-rama (1/9/2026) — necesario para poder juzgar Lateral y
+  // Tendencia por separado en vez de un promedio que puede esconder que una
+  // rama compensa a la otra.
+  const bySubStrategy = {};
+  for (const t of trades) {
+    if (!bySubStrategy[t.subStrategy]) bySubStrategy[t.subStrategy] = { trades: 0, wins: 0, losses: 0, netPnl: 0 };
+    const b = bySubStrategy[t.subStrategy];
+    b.trades++; if (t.pnl > 0) b.wins++; else if (t.pnl < 0) b.losses++; b.netPnl += t.pnl;
+  }
+  for (const k in bySubStrategy) {
+    bySubStrategy[k].winRate = (bySubStrategy[k].wins / bySubStrategy[k].trades * 100).toFixed(1);
+    bySubStrategy[k].netPnl = bySubStrategy[k].netPnl.toFixed(2);
+  }
   return {
     trades: trades.length, wins, losses,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
@@ -3125,6 +3143,7 @@ async function runScalpingRealisticBacktest(pair, days, config) {
     totalReturn: ((totalPnl / initialCapital) * 100).toFixed(2),
     maxDrawdown: (maxDrawdown * 100).toFixed(2),
     closedByReason,
+    bySubStrategy,
     candlesUsed: { c5: candles5.length, c1: candles1.length, c15: candles15.length }
   };
 }
@@ -3325,13 +3344,13 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
-      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr });
+      const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, onlySubStrategy });
       return res.json({
         success: true,
-        config: { pair, days, minConfidence, riskPct, initialCapital, strategy, earlyBreakeven, breakevenTriggerAtr },
+        config: { pair, days, minConfidence, riskPct, initialCapital, strategy, earlyBreakeven, breakevenTriggerAtr, onlySubStrategy: onlySubStrategy || 'ambas' },
         dataRange: { note: 'Simula la salida por reversión (real, la más frecuente en vivo) + breakeven opcional — ver candlesUsed en el resultado' },
         result
       });

@@ -1589,9 +1589,11 @@ async function runAutoCheckInner() {
         }
       }
 
-      // Manual (31/8/2026): sin trailing/breakeven automático, a propósito —
-      // el usuario ya definió su propio TP/SL, no queremos tocarlos.
-      if (t.signal === 'COMPRAR' && t.strategy !== 'Manual') {
+      // Manual (31/8) y Estructura (1/9): sin trailing/breakeven automático,
+      // a propósito — Manual porque el usuario define su TP/SL, Estructura
+      // porque el backtest que la validó usó SL/TP fijos sin gestión activa;
+      // agregarle trailing acá correría distinto de lo que se probó.
+      if (t.signal === 'COMPRAR' && t.strategy !== 'Manual' && t.strategy !== 'Estructura') {
         if (recentHigh > t.peakPrice) t.peakPrice = recentHigh;
         const favorableMove = t.peakPrice - t.entry;
         if (favorableMove >= activationDistance) {
@@ -1624,7 +1626,7 @@ async function runAutoCheckInner() {
             }
           }
         }
-      } else if (t.signal === 'VENDER' && t.strategy !== 'Manual') {
+      } else if (t.signal === 'VENDER' && t.strategy !== 'Manual' && t.strategy !== 'Estructura') {
         if (recentLow < t.peakPrice) t.peakPrice = recentLow;
         const favorableMove = t.entry - t.peakPrice;
         if (favorableMove >= activationDistance) {
@@ -1887,6 +1889,19 @@ async function runAutoCheckInner() {
         // if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
+
+    // Entrada por Estructura (1/9/2026) — CONECTADA al auto-trading en vivo hoy,
+    // tras validarse cross-asset en backtest out-of-sample (BTC y ETH, dos
+    // ventanas de 90 días cada uno, ADX≥30: 3 de 4 ventanas netas positivas,
+    // la 4ta casi neutral). Corre en 30m con contexto de 4h, igual que se
+    // backtesteó. minAdx4h=30 fijo — el umbral que mejor validó cruzando
+    // activos. Capital DEMO únicamente.
+    try {
+      const { closes: closes30e, highs: highs30e, lows: lows30e } = await fetchKlines(pair, '30m', 100);
+      const { closes: closesH4e, highs: highsH4e, lows: lowsH4e } = await fetchKlines(pair, '4h', 60);
+      const f = analyzeStructuralEntry(closes30e, highs30e, lows30e, closesH4e, highsH4e, lowsH4e, 30);
+      if (f && f.signal !== 'NEUTRO') signals.push({ tf: '30m', pair, signal: f.signal, confidence: f.confidence, analysis: f });
+    } catch (e) { console.log(`Analyze Estructura error ${pair}:`, e.message); }
     // Rebote PAUSADA (4/8/2026) — backtest de 90 días / 264 operaciones dio
     // PnL BRUTO negativo (-$28.47, antes de comisión): la señal de entrada no
     // tiene filo real, no es un problema de calibración de salida. Winrate
@@ -1927,6 +1942,10 @@ async function runAutoCheckInner() {
       // de aciertos en 16 operaciones), muchas entradas de baja convicción.
       if (s.analysis.strategy === 'Scalping' && s.analysis.regime === 'Lateral') return s.confidence >= 78;
       if (s.analysis.strategy === 'Rebote' || s.analysis.strategy === 'Scalping') return s.confidence >= 60;
+      // Estructura ya se autofiltra adentro (ADX 4h≥30 + ruptura de swing
+      // confirmada) — no tiene un número de confianza graduado como las
+      // demás (siempre 75), así que el umbral genérico de 90 no aplica acá.
+      if (s.analysis.strategy === 'Estructura') return true;
       return s.confidence >= state.minConfidence;
     };
     const buys = signals.filter(s => s.signal === 'COMPRAR' && passesConfidence(s));

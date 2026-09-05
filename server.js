@@ -2017,6 +2017,23 @@ async function runAutoCheckInner() {
 
   // Open a trade for EVERY free pair with a valid signal (not just the single best) —
   // this is what actually increases daily trade frequency vs. the old one-at-a-time logic
+  //
+  // SEGURO (5/9/2026): el auto-trading (Estructura, o cualquier estrategia
+  // automática futura) NUNCA debe ejecutar una orden real en Testnet/Real sin
+  // una habilitación aparte y explícita — independiente de que el modo global
+  // esté en Testnet/Real para poder operar MANUAL ahí. Antes, cambiar el modo
+  // global ya alcanzaba para que el auto-trading empezara a mandar órdenes
+  // reales en su próxima señal, sin que nadie lo pidiera específicamente.
+  // AUTO_TRADING_LIVE_ENABLED (apagado por defecto) es el interruptor
+  // separado — cambiar a true solo después de validar manual a fondo en
+  // Testnet, y con Juan confirmando explícitamente que quiere ese paso.
+  const AUTO_TRADING_LIVE_ENABLED = false;
+  if (state.tradingMode !== 'demo' && !AUTO_TRADING_LIVE_ENABLED) {
+    if (allSignals.length > 0) {
+      console.log(`Auto-trading real DESHABILITADO (AUTO_TRADING_LIVE_ENABLED=false) — se ignoran ${allSignals.length} señal(es) automática(s) mientras el modo es ${state.tradingMode}. El trading manual no se ve afectado por esto.`);
+    }
+    return;
+  }
   for (const best of allSignals) {
     await openTrade(best.pair, best.tf, best.analysis);
   }
@@ -2191,7 +2208,7 @@ app.post("/state/open-manual-trade", async (req, res) => {
   }
   try {
     const { closes } = await fetchKlines(pair, "1m", 2);
-    const entry = closes[closes.length - 1];
+    let entry = closes[closes.length - 1];
     // Chequeo de sentido común: el TP tiene que estar del lado correcto según
     // la dirección, si no la operación no tendría forma de resolverse a favor.
     if (signal === 'COMPRAR' && (tp <= entry || sl >= entry)) {
@@ -2200,9 +2217,47 @@ app.post("/state/open-manual-trade", async (req, res) => {
     if (signal === 'VENDER' && (tp >= entry || sl <= entry)) {
       return res.status(400).json({ error: `Para VENDER, el TP (${tp}) tiene que estar abajo del precio actual (${entry.toFixed(2)}) y el SL arriba` });
     }
+    // Ejecución real en Testnet/Real (5/9/2026) — antes el manual SIEMPRE
+    // simulaba internamente, nunca tocaba Binance ni en Testnet ni en Real,
+    // aunque el modo global estuviera puesto ahí. Ahora sí ejecuta de verdad
+    // cuando corresponde — reusando las mismas funciones ya probadas del
+    // lado automático (getRealBalance/placeRealOrder/roundQtyForBinance),
+    // pero SOLO para esta operación puntual que el usuario pidió a mano.
+    // Esto es completamente independiente del interruptor
+    // AUTO_TRADING_LIVE_ENABLED que frena al auto-trading — uno no habilita
+    // al otro.
+    let capitalBase = state.capital;
+    let qty, size;
+    if (state.tradingMode !== 'demo') {
+      if (state.killSwitchActive) {
+        return res.status(400).json({ error: 'Kill switch activo — no se puede abrir ninguna operación real (ni manual) hasta desactivarlo.' });
+      }
+      try {
+        capitalBase = await getRealBalance(state.tradingMode);
+      } catch (e) {
+        return res.status(400).json({ error: `No se pudo leer el saldo real de ${state.tradingMode.toUpperCase()}: ${e.message}` });
+      }
+    }
     const pct = sizePct || state.positionSizePct || 30;
-    const size = state.capital * (pct / 100);
-    const qty = entry > 0 ? size / entry : 0;
+    size = capitalBase * (pct / 100);
+    qty = entry > 0 ? size / entry : 0;
+
+    if (state.tradingMode !== 'demo') {
+      qty = roundQtyForBinance(pair, qty);
+      if (qty <= 0) {
+        return res.status(400).json({ error: 'La cantidad calculada da demasiado chica para que Binance la acepte — probá con un sizePct más alto.' });
+      }
+      const side = signal === 'COMPRAR' ? 'BUY' : 'SELL';
+      try {
+        const order = await placeRealOrder(state.tradingMode, pair, side, qty);
+        entry = extractFillPrice(order, entry);
+        qty = parseFloat(order.executedQty) || qty;
+        size = qty * entry;
+      } catch (e) {
+        return res.status(400).json({ error: `Falló la orden real (${state.tradingMode.toUpperCase()}): ${e.message} — no se abrió ninguna posición.` });
+      }
+    }
+
     const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
     const trade = {
       id: Date.now() + '-' + pair, pair, signal, direction: signal === 'COMPRAR' ? 'LARGO' : 'SHORT',
@@ -2215,7 +2270,8 @@ app.post("/state/open-manual-trade", async (req, res) => {
     };
     state.openTrades.push(trade);
     await saveState(state);
-    sendTelegram(`✋ OPERACIÓN MANUAL ABIERTA (Servidor)\n📊 ${pair.replace('USDT','/USDT')}\n${signal} · ${trade.direction}\n💵 Entrada: $${entry.toFixed(2)}\n🎯 TP: $${trade.tp.toFixed(2)}\n🛑 SL: $${trade.sl.toFixed(2)}\n📊 R/R: 1:${rr.toFixed(2)}\n💰 Tamaño: ${pct}% del capital\nSin breakeven/trailing automático — TP/SL fijos, tal como los pusiste.`);
+    const modeTag = state.tradingMode !== 'demo' ? ` [${state.tradingMode.toUpperCase()} — orden real ejecutada]` : '';
+    sendTelegram(`✋ OPERACIÓN MANUAL ABIERTA${modeTag} (Servidor)\n📊 ${pair.replace('USDT','/USDT')}\n${signal} · ${trade.direction}\n💵 Entrada: $${entry.toFixed(2)}\n🎯 TP: $${trade.tp.toFixed(2)}\n🛑 SL: $${trade.sl.toFixed(2)}\n📊 R/R: 1:${rr.toFixed(2)}\n💰 Tamaño: ${pct}% del capital\nSin breakeven/trailing automático — TP/SL fijos, tal como los pusiste.`);
     res.json({ success: true, trade, state });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2339,68 +2395,23 @@ app.post("/real-order-test", async (req, res) => {
   }
 });
 
-app.post("/balance", async (req, res) => {
-  const { apiKey, apiSecret } = req.body;
-  if (!apiKey || !apiSecret) return res.status(400).json({ error: "Faltan claves" });
-  try {
-    const timestamp = Date.now();
-    const query = `timestamp=${timestamp}`;
-    const signature = hmac(apiSecret, query);
-    const response = await fetch(`https://api.binance.com/api/v3/account?${query}&signature=${signature}`, {
-      headers: { "X-MBX-APIKEY": apiKey }
-    });
-    const data = await response.json();
-    if (data.code) return res.status(400).json({ error: data.msg });
-    const usdt = data.balances?.find(b => b.asset === "USDT");
-    res.json({ usdt: usdt ? parseFloat(usdt.free) : 0 });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post("/order", async (req, res) => {
-  const { apiKey, apiSecret, symbol, side, quantity, type = "MARKET" } = req.body;
-  if (!apiKey || !apiSecret || !symbol || !side || !quantity) {
-    return res.status(400).json({ error: "Faltan parámetros" });
-  }
-  try {
-    const timestamp = Date.now();
-    const params = `symbol=${symbol}&side=${side}&type=${type}&quantity=${quantity}&timestamp=${timestamp}`;
-    const signature = hmac(apiSecret, params);
-    const response = await fetch(`https://api.binance.com/api/v3/order`, {
-      method: "POST",
-      headers: { "X-MBX-APIKEY": apiKey, "Content-Type": "application/x-www-form-urlencoded" },
-      body: `${params}&signature=${signature}`
-    });
-    const data = await response.json();
-    if (data.code) return res.status(400).json({ error: data.msg });
-    await sendTelegram(`🔔 ORDEN REAL EJECUTADA\n${symbol} ${side}\nCantidad: ${data.executedQty}`);
-    res.json({ success: true, orderId: data.orderId, executedQty: data.executedQty, price: data.fills?.[0]?.price });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// (5/9/2026) Se sacaron acá /balance, /order y /webhook — eran resabios de
+// antes de pasar a variables de entorno (ver handoff del 5/9): aceptaban
+// apiKey/apiSecret directo en el body del pedido, sin ningún secreto que
+// protegiera /balance ni /order. No exponían TU clave (necesitaban que quien
+// llame mande la suya propia), pero eran una puerta abierta: cualquiera con
+// la URL podía hacer que tu servidor ejecutara órdenes o disparara tu
+// Telegram con sus propias claves. Confirmado que el frontend actual no los
+// usa (usa /real-balance, que sí está bien armado con mode+env vars) y que
+// no hay integración externa activa (webhook confirmado sin uso por Juan).
+// /alert se dejó intacto — lo usa el botón de "probar resumen diario" y no
+// maneja claves ni ejecuta operaciones, solo manda un mensaje a Telegram.
 
 app.post("/alert", async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: "Falta mensaje" });
   await sendTelegram(message);
   res.json({ success: true });
-});
-
-app.post("/webhook", async (req, res) => {
-  const { secret, action, symbol, quantity, apiKey, apiSecret } = req.body;
-  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Secret inválido" });
-  try {
-    const side = action === "buy" ? "BUY" : "SELL";
-    const timestamp = Date.now();
-    const params = `symbol=${symbol}&side=${side}&type=MARKET&quantity=${quantity}&timestamp=${timestamp}`;
-    const signature = hmac(apiSecret, params);
-    const response = await fetch(`https://api.binance.com/api/v3/order`, {
-      method: "POST",
-      headers: { "X-MBX-APIKEY": apiKey, "Content-Type": "application/x-www-form-urlencoded" },
-      body: `${params}&signature=${signature}`
-    });
-    const data = await response.json();
-    await sendTelegram(`🎯 WEBHOOK: ${side} ${symbol}`);
-    res.json({ success: true, order: data });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Daily summary (22hs Argentina) ────────────────────────

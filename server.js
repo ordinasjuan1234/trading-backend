@@ -1307,7 +1307,14 @@ async function openTrade(pair, tf, analysis) {
   const volInfo = analysis.volRegime ? `\n📊 Volatilidad del momento: ${analysis.volRegime}` : '';
   const adxInfo = (analysis.adx !== undefined && analysis.adx !== null) ? `\n📐 ADX: ${analysis.adx.toFixed(1)} (${analysis.adx >= 20 ? 'tendencia confirmada' : 'mercado lateral'})` : '';
   const regimeInfo = analysis.regime ? `\n🔎 Régimen (1m): ${analysis.regime}` : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}${regimeInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  // Estructura (1/9/2026) usa sus propios campos (adx4h, regime4h) en vez de
+  // adx/regime genéricos — sin esto, la notificación de su primera operación
+  // no mostraría nada de contexto, justo la que más interesa ver en detalle
+  // por ser la primera vez que opera con plata (demo) de verdad.
+  const structInfo = (analysis.adx4h !== undefined && analysis.adx4h !== null)
+    ? `\n📐 ADX 4h: ${analysis.adx4h.toFixed(1)} (régimen: ${analysis.regime4h})`
+    : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}${regimeInfo}${structInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
 }
 
 // Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,

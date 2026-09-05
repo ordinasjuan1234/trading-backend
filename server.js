@@ -490,40 +490,38 @@ function analyzeScalping(closes, highs, lows, opens1m, highs1m, lows1m, closes1m
       }
     }
   } else {
-    // Scalping-Lateral PAUSADA (31/7, noche) — evidencia acumulada de fallo
-    // repetido: 0% de aciertos en 16 operaciones antes del primer arreglo, y
-    // después de 3 correcciones más, seguía perdiendo la mayoría (42 de 50).
-    // Causa nueva encontrada: el objetivo se calcula como fracción del rango
-    // observado en 30 min — si el mercado está tranquilo (rango angosto), el
-    // objetivo es tan chico que ni tocándolo cubre la comisión. Antes de
-    // reactivarla, hay que agregar un piso mínimo de tamaño de rango (relativo
-    // al ATR) para no operar cuando el rango es demasiado angosto para valer
-    // la pena. Queda el código intacto, comentado el disparo de señal.
-    /*
+    // Scalping-Lateral REACTIVADA con arreglo (1/9/2026) — estuvo pausada
+    // desde el 31/7 (0% de aciertos en 16 operaciones, luego 42/50 perdedoras
+    // tras 3 intentos de arreglo). Causa real diagnosticada en su momento:
+    // el objetivo se calculaba como fracción del rango de 30 min sin piso —
+    // en mercado tranquilo (rango angosto), el objetivo era tan chico que ni
+    // tocándolo cubría la comisión. Se agrega ahora el piso que quedó
+    // pendiente: MIN_RANGE_ATR exige que el rango completo sea al menos
+    // este múltiplo del ATR antes de operar — si el rango es angosto, no
+    // hay señal, sin importar la posición del precio adentro. Backtesteado
+    // (ver runScalpingRealisticBacktest con onlySubStrategy) antes de
+    // confiar en esto en vivo — no reactivar sin ese backtest.
+    const MIN_RANGE_ATR = 1.5;
     const rangeLookback = Math.min(6, highs.length);
     const recentHighs = highs.slice(-rangeLookback);
     const recentLows = lows.slice(-rangeLookback);
     const rangeTop = Math.max(...recentHighs);
     const rangeBottom = Math.min(...recentLows);
     const rangeSize = rangeTop - rangeBottom || price * 0.001;
-    const posInRange = (price - rangeBottom) / rangeSize;
-    if (posInRange <= 0.15) {
-      signal = 'COMPRAR'; direction = 'LARGO';
-      confidence = Math.round(75 + (0.15 - posInRange) * 60);
-    } else if (posInRange >= 0.85) {
-      signal = 'VENDER'; direction = 'SHORT';
-      confidence = Math.round(75 + (posInRange - 0.85) * 60);
-    }
-    if (signal === 'COMPRAR') {
-      lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
-    } else if (signal === 'VENDER') {
-      lateralTp1 = rangeTop - rangeSize * 0.6; lateralTp2 = rangeBottom; lateralSl = rangeTop + atr * 0.5;
-    }
-    */
-    if (signal === 'COMPRAR') {
-      lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
-    } else if (signal === 'VENDER') {
-      lateralTp1 = rangeTop - rangeSize * 0.6; lateralTp2 = rangeBottom; lateralSl = rangeTop + atr * 0.5;
+    if (rangeSize >= atr * MIN_RANGE_ATR) {
+      const posInRange = (price - rangeBottom) / rangeSize;
+      if (posInRange <= 0.15) {
+        signal = 'COMPRAR'; direction = 'LARGO';
+        confidence = Math.round(75 + (0.15 - posInRange) * 60);
+      } else if (posInRange >= 0.85) {
+        signal = 'VENDER'; direction = 'SHORT';
+        confidence = Math.round(75 + (posInRange - 0.85) * 60);
+      }
+      if (signal === 'COMPRAR') {
+        lateralTp1 = rangeBottom + rangeSize * 0.6; lateralTp2 = rangeTop; lateralSl = rangeBottom - atr * 0.5;
+      } else if (signal === 'VENDER') {
+        lateralTp1 = rangeTop - rangeSize * 0.6; lateralTp2 = rangeBottom; lateralSl = rangeTop + atr * 0.5;
+      }
     }
   }
 
@@ -1930,9 +1928,24 @@ async function runAutoCheckInner() {
       // completo y las ~31 salidas por reversión SIEMPRE perdedoras — no es
       // un problema de timing de salida, es que la entrada revierte antes de
       // llegar al TP con demasiada frecuencia. Mismo veredicto que Rebote:
-      // sin filo real confirmado. Scalping-Lateral sigue activo (no se tocó,
-      // no hay evidencia nueva sobre esa rama).
-      if (e && !(e.regime && e.regime.startsWith('Tendencia'))) signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
+      // sin filo real confirmado.
+      // Scalping-Lateral: corrección importante (1/9/2026) — durante meses
+      // este comentario decía "sigue activa, no se tocó" pero eso era
+      // INCORRECTO: desde el 31/7 el código que genera la señal de esta rama
+      // estaba comentado (analyzeScalping) — nunca disparó una sola señal en
+      // vivo, más allá de cualquier umbral de confianza. Hoy se le agregó el
+      // piso de rango mínimo (MIN_RANGE_ATR) que quedó pendiente en su
+      // momento, y la señal ya vuelve a generarse — pero todavía NO se
+      // habilita acá el push a producción (LATERAL_LIVE_ENABLED) hasta
+      // backtestearla con el piso nuevo. Cambiar a true recién después de
+      // validar con runScalpingRealisticBacktest(onlySubStrategy:'Scalping-Lateral').
+      const LATERAL_LIVE_ENABLED = false;
+      const isLateral = e && e.regime && !e.regime.startsWith('Tendencia');
+      if (e && e.regime && e.regime.startsWith('Tendencia')) {
+        // Tendencia: generada pero pausada — no se empuja (comportamiento sin cambios).
+      } else if (isLateral && LATERAL_LIVE_ENABLED) {
+        signals.push({ tf: '5m', pair, signal: e.signal, confidence: e.confidence, analysis: e });
+      }
     } catch (e) { console.log(`Analyze Scalping error ${pair}:`, e.message); }
     // Rebote y Scalping usan su PROPIO umbral de confianza (más bajo a propósito)
     // en vez del global — son estrategias distintas, pensadas para operar seguido

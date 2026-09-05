@@ -1895,16 +1895,17 @@ async function runAutoCheckInner() {
       } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
     }
 
-    // Entrada por Estructura (1/9/2026) — CONECTADA al auto-trading en vivo hoy,
-    // tras validarse cross-asset en backtest out-of-sample (BTC y ETH, dos
-    // ventanas de 90 días cada uno, ADX≥30: 3 de 4 ventanas netas positivas,
-    // la 4ta casi neutral). Corre en 30m con contexto de 4h, igual que se
-    // backtesteó. minAdx4h=30 fijo — el umbral que mejor validó cruzando
-    // activos. Capital DEMO únicamente.
+    // Entrada por Estructura (1/9/2026, ajustada 4/9/2026) — CONECTADA al
+    // auto-trading en vivo, validada cross-asset out-of-sample (BTC y ETH,
+    // dos ventanas de 90 días cada uno). Se probó la curva completa de
+    // umbral (20/25/30): ADX≥25 ganó en las 4 ventanas sin excepción —
+    // primera vez que las 4 dan positivo a la vez, y con más operaciones
+    // en los períodos de mercado más flojo (donde antes casi no operaba).
+    // minAdx4h=25 (bajado de 30 el 4/9, con backtest que lo respalda).
     try {
       const { closes: closes30e, highs: highs30e, lows: lows30e } = await fetchKlines(pair, '30m', 100);
       const { closes: closesH4e, highs: highsH4e, lows: lowsH4e } = await fetchKlines(pair, '4h', 60);
-      const f = analyzeStructuralEntry(closes30e, highs30e, lows30e, closesH4e, highsH4e, lowsH4e, 30);
+      const f = analyzeStructuralEntry(closes30e, highs30e, lows30e, closesH4e, highsH4e, lowsH4e, 25);
       if (f && f.signal !== 'NEUTRO') signals.push({ tf: '30m', pair, signal: f.signal, confidence: f.confidence, analysis: f });
     } catch (e) { console.log(`Analyze Estructura error ${pair}:`, e.message); }
     // Rebote PAUSADA (4/8/2026) — backtest de 90 días / 264 operaciones dio
@@ -2058,15 +2059,15 @@ app.get("/debug/signals", async (req, res) => {
     const e = analyzeScalping(closes5, highs5, lows5, opens1, highs1, lows1, closes1, volumes1, highs15, lows15, closes15);
     if (e) results.push({ tf: '5m', strategy: 'Scalping', signal: e.signal, confidence: e.confidence, regimen: e.regime, ...withDistances(e) });
 
-    // Entrada por estructura (1/9/2026) — SOLO OBSERVACIÓN todavía, no está
-    // conectada al loop de auto-trading. Umbral ADX≥30 en 4h, el que dio el
-    // mejor resultado cross-asset en el backtest (BTC y ETH, out-of-sample
-    // en las dos mitades de 180 días). Se muestra acá para comparar señales
-    // reales contra lo que predijo el backtest antes de sumarla a auto-trading.
+    // Entrada por estructura (1/9/2026, ajustada 4/9/2026) — ya está
+    // conectada al auto-trading real (el label "solo observación" quedó
+    // desactualizado, se mantiene para no romper nada que lea este campo).
+    // Umbral ADX≥25 (bajado de 30 el 4/9: backtest out-of-sample mostró que
+    // 25 gana en las 4 ventanas probadas, sin excepción).
     try {
       const { closes: closes30, highs: highs30, lows: lows30 } = await fetchKlines(pair, '30m', 100);
       const { closes: closesH4, highs: highsH4, lows: lowsH4 } = await fetchKlines(pair, '4h', 60);
-      const f = analyzeStructuralEntry(closes30, highs30, lows30, closesH4, highsH4, lowsH4, 30);
+      const f = analyzeStructuralEntry(closes30, highs30, lows30, closesH4, highsH4, lowsH4, 25);
       if (f) results.push({ tf: '30m', strategy: 'Estructura (solo observación)', signal: f.signal, confidence: f.confidence, reason: f.reason, adx4h: f.adx4h !== undefined ? f.adx4h.toFixed(1) : undefined, regime4h: f.regime4h, ...withDistances(f) });
     } catch (structErr) {
       results.push({ tf: '30m', strategy: 'Estructura (solo observación)', signal: 'ERROR', error: structErr.message });

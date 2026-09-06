@@ -13,6 +13,13 @@ const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por 
 // Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
 const SIZING_MODE = 'risk';
 const RISK_PER_TRADE_PCT = 0.75;
+// ── Fase 2b: límite de tiempo de Estructura alineado a lo validado ──
+// 'validated' = Estructura cierra a las 48 h SIEMPRE, vaya ganando o perdiendo (lo que se backtesteó).
+// 'legacy'    = comportamiento anterior: a las 48 h solo cierra si no va en pérdida neta; si pierde,
+//               espera hasta 144 h (3x). Backtest 6/9/2026: esa extensión no aporta neto y casi duplica
+//               el drawdown (BTC jun-sep DD 5,8% → 9,4%; ETH jun-sep 3,8% → 6,7%).
+// Solo afecta a trades con strategy === 'Estructura'; el resto de estrategias (pausadas) no cambia.
+const TIME_LIMIT_MODE = 'validated';
 // ── Fase 3a: vigilancia mínima ──
 // AUTO_TRADING_LIVE_ENABLED vive ahora acá arriba (antes estaba dentro de runAutoCheckInner) para que
 // /state, el resumen diario y el aviso de bloqueo lean el mismo valor que usa el loop.
@@ -1848,7 +1855,8 @@ async function runAutoCheckInner() {
           const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
           const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
           const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
-          if (!inLoss || hitHardCap) {
+          const closeNow = (TIME_LIMIT_MODE === 'validated' && t.strategy === 'Estructura') || !inLoss || hitHardCap; // Fase 2b
+          if (closeNow) {
             // El motivo distingue si cerró al límite normal (ya en ganancia/neutro)
             // o si esperó hasta el límite duro sin lograr salir de la pérdida.
             const reason = hitHardCap && inLoss ? `Cierre por tiempo (límite duro ${HARD_MAX_HOURS_OPEN}hs, seguía en pérdida)` : `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`;
@@ -1867,7 +1875,8 @@ async function runAutoCheckInner() {
         const inLoss = pricePct < COMMISSION_ROUNDTRIP_PCT;
         const HARD_MAX_HOURS_OPEN = MAX_HOURS_OPEN * 3;
         const hitHardCap = hoursOpen >= HARD_MAX_HOURS_OPEN;
-        if (!inLoss || hitHardCap) {
+        const closeNow = (TIME_LIMIT_MODE === 'validated' && t.strategy === 'Estructura') || !inLoss || hitHardCap; // Fase 2b
+        if (closeNow) {
           const reason = hitHardCap && inLoss ? `Cierre por tiempo (límite duro ${HARD_MAX_HOURS_OPEN}hs, seguía en pérdida)` : `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`;
           await closeTradeById(t.id, currentPrice, reason);
           sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba ${hoursOpen.toFixed(2)}hs abierta sin tocar TP/SL${hitHardCap && inLoss ? ' (esperó hasta el límite duro, seguía en pérdida)' : ''}\nSe cerró al precio de mercado para liberar el capital.`);
@@ -2194,7 +2203,7 @@ app.post("/test/daily-summary", async (req, res) => {
 
 app.get("/state", (req, res) => {
   // Fase 2: se expone la config de tamaño (constantes del código, no editables desde el panel)
-  res.json({ ...state, sizing: { mode: SIZING_MODE, riskPerTradePct: SIZING_MODE === 'risk' ? RISK_PER_TRADE_PCT : null, fixedPct: SIZING_MODE === 'fixed' ? (state.positionSizePct || 30) : null, autoTradingLiveEnabled: AUTO_TRADING_LIVE_ENABLED, blockedByMode: autoTradingBlockedByMode() } });
+  res.json({ ...state, sizing: { mode: SIZING_MODE, riskPerTradePct: SIZING_MODE === 'risk' ? RISK_PER_TRADE_PCT : null, fixedPct: SIZING_MODE === 'fixed' ? (state.positionSizePct || 30) : null, autoTradingLiveEnabled: AUTO_TRADING_LIVE_ENABLED, blockedByMode: autoTradingBlockedByMode(), timeLimitMode: TIME_LIMIT_MODE } });
 });
 
 app.post("/state/config", async (req, res) => {

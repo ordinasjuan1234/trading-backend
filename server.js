@@ -11,7 +11,7 @@ const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por 
 // 'risk'  = módulo de riesgo: arriesga RISK_PER_TRADE_PCT del capital según la distancia al SL.
 // Se deploya en 'fixed' y se cambia a 'risk' a propósito, en un commit aparte, igual que AUTO_TRADING_LIVE_ENABLED.
 // Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
-const SIZING_MODE = 'fixed';
+const SIZING_MODE = 'risk';
 const RISK_PER_TRADE_PCT = 0.75;
 
 // Formatea fecha/hora de Argentina a mano, sin depender de toLocaleString.

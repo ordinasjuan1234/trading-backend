@@ -13,6 +13,30 @@ const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por 
 // Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
 const SIZING_MODE = 'risk';
 const RISK_PER_TRADE_PCT = 0.75;
+// ── Fase 3a: vigilancia mínima ──
+// AUTO_TRADING_LIVE_ENABLED vive ahora acá arriba (antes estaba dentro de runAutoCheckInner) para que
+// /state, el resumen diario y el aviso de bloqueo lean el mismo valor que usa el loop.
+// Sigue en false: el auto-trading solo opera en modo demo. Cambiar a true es una decisión aparte y explícita.
+const AUTO_TRADING_LIVE_ENABLED = false;
+// Aviso por Telegram cuando el auto-trading está bloqueado por el modo (autoMode=true, modo≠demo, live deshabilitado).
+// Ya pasó dos veces (5/9 y 6/9) sin que nadie se enterara: el bot quedaba en silencio y parecía "falta de señal".
+let modeBlockWarnedAt = 0;
+const MODE_BLOCK_WARN_EVERY_MS = 6 * 60 * 60 * 1000; // repite el aviso cada 6 h mientras siga bloqueado
+function autoTradingBlockedByMode() {
+  return !!state.autoMode && state.tradingMode !== 'demo' && !AUTO_TRADING_LIVE_ENABLED;
+}
+function checkModeBlockAndWarn() {
+  const now = Date.now();
+  if (autoTradingBlockedByMode()) {
+    if (now - modeBlockWarnedAt > MODE_BLOCK_WARN_EVERY_MS) {
+      modeBlockWarnedAt = now;
+      sendTelegram(`⚠️ AUTO-TRADING BLOQUEADO POR MODO\nEl bot está en modo ${String(state.tradingMode).toUpperCase()} con autoMode activo, pero el auto-trading real está deshabilitado (AUTO_TRADING_LIVE_ENABLED=false).\nNo va a abrir ninguna operación automática hasta volver a DEMO.\nPara corregir: POST /mode/set {"mode":"demo"} o desde el panel.`);
+    }
+  } else if (modeBlockWarnedAt) {
+    modeBlockWarnedAt = 0;
+    sendTelegram(`✅ Auto-trading desbloqueado: modo ${String(state.tradingMode).toUpperCase()}, vuelve a poder operar.`);
+  }
+}
 
 // Formatea fecha/hora de Argentina a mano, sin depender de toLocaleString.
 // Esto evita bugs de compatibilidad si el servidor corre con soporte de
@@ -1548,6 +1572,7 @@ async function runAutoCheck() {
   }
   isAutoCheckRunning = true;
   try {
+    checkModeBlockAndWarn(); // Fase 3a: avisa si el modo bloquea el auto-trading, aunque no haya señales
     await runAutoCheckInner();
   } catch (e) {
     console.log('Error en runAutoCheck:', e.message);
@@ -2049,7 +2074,7 @@ async function runAutoCheckInner() {
   // AUTO_TRADING_LIVE_ENABLED (apagado por defecto) es el interruptor
   // separado — cambiar a true solo después de validar manual a fondo en
   // Testnet, y con Juan confirmando explícitamente que quiere ese paso.
-  const AUTO_TRADING_LIVE_ENABLED = false;
+  // (AUTO_TRADING_LIVE_ENABLED se declara arriba del archivo — Fase 3a)
   if (state.tradingMode !== 'demo' && !AUTO_TRADING_LIVE_ENABLED) {
     if (allSignals.length > 0) {
       console.log(`Auto-trading real DESHABILITADO (AUTO_TRADING_LIVE_ENABLED=false) — se ignoran ${allSignals.length} señal(es) automática(s) mientras el modo es ${state.tradingMode}. El trading manual no se ve afectado por esto.`);
@@ -2155,9 +2180,21 @@ app.get("/stats/all-modes", async (req, res) => {
   }
 });
 
+// Fase 3a: disparar el resumen diario a mano para verificar el formato nuevo sin esperar a la noche.
+// NO resetea los contadores del día (dailyPnl/dailyTrades) — solo manda el mensaje.
+app.post("/test/daily-summary", async (req, res) => {
+  try {
+    const savedPnl = state.dailyPnl, savedTrades = state.dailyTrades;
+    await sendDailySummaryMsg();
+    state.dailyPnl = savedPnl; state.dailyTrades = savedTrades;
+    await saveState(state);
+    res.json({ success: true, sent: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/state", (req, res) => {
   // Fase 2: se expone la config de tamaño (constantes del código, no editables desde el panel)
-  res.json({ ...state, sizing: { mode: SIZING_MODE, riskPerTradePct: SIZING_MODE === 'risk' ? RISK_PER_TRADE_PCT : null, fixedPct: SIZING_MODE === 'fixed' ? (state.positionSizePct || 30) : null, autoTradingLiveEnabled: false } });
+  res.json({ ...state, sizing: { mode: SIZING_MODE, riskPerTradePct: SIZING_MODE === 'risk' ? RISK_PER_TRADE_PCT : null, fixedPct: SIZING_MODE === 'fixed' ? (state.positionSizePct || 30) : null, autoTradingLiveEnabled: AUTO_TRADING_LIVE_ENABLED, blockedByMode: autoTradingBlockedByMode() } });
 });
 
 app.post("/state/config", async (req, res) => {
@@ -2468,7 +2505,19 @@ async function sendDailySummaryMsg() {
   else if (state.dailyPnl < 0) motivacion = '🔴 Día difícil. Revisá las señales y descansá.';
   else motivacion = '⚪ Día tranquilo. El mercado espera su momento.';
   const now = formatArgTime(new Date());
-  sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L hoy: ${state.dailyPnl>=0?'+':''}$${state.dailyPnl.toFixed(2)}\n🎯 Operaciones hoy: ${state.dailyTrades}\n✅ Ganadas: ${wins}\n❌ Perdidas: ${losses}\n📊 Win Rate: ${winRate}%\n\n${motivacion}`);
+  // Fase 3a: estado del sistema + ADX 4h de cada par, para saber cada mañana POR QUÉ operó o no operó
+  let adxLines = '';
+  for (const pair of ['BTCUSDT', 'ETHUSDT']) {
+    try {
+      const { closes: c4, highs: h4, lows: l4 } = await fetchKlines(pair, '4h', 60);
+      const adx = calcADX(h4, l4, c4, 14);
+      const adxNum = typeof adx === 'number' ? adx : (adx && typeof adx.adx === 'number' ? adx.adx : null);
+      adxLines += `\n   ${pair.replace('USDT', '')}: ADX 4h ${adxNum !== null ? adxNum.toFixed(1) : 'n/d'} ${adxNum !== null ? (adxNum >= 25 ? '✅ habilita' : '⏸ < 25, sin tendencia') : ''}`;
+    } catch (e) { adxLines += `\n   ${pair.replace('USDT', '')}: ADX 4h error (${e.message})`; }
+  }
+  const bloqueado = autoTradingBlockedByMode() ? '\n⚠️ AUTO-TRADING BLOQUEADO: modo ≠ demo' : '';
+  const sistema = `🔧 Modo: ${String(state.tradingMode).toUpperCase()} · autoMode: ${state.autoMode ? 'ON' : 'OFF'} · tamaño: ${SIZING_MODE === 'risk' ? `riesgo ${RISK_PER_TRADE_PCT}%` : `fijo ${state.positionSizePct || 30}%`}${bloqueado}\n📡 Filtro Estructura (umbral ADX 25):${adxLines}`;
+  sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L hoy: ${state.dailyPnl>=0?'+':''}$${state.dailyPnl.toFixed(2)}\n🎯 Operaciones hoy: ${state.dailyTrades}\n✅ Ganadas: ${wins}\n❌ Perdidas: ${losses}\n📊 Win Rate: ${winRate}%\n\n${sistema}\n\n${motivacion}`);
   state.dailyPnl = 0; state.dailyTrades = 0;
   await saveState(state);
 }
@@ -3496,7 +3545,8 @@ app.listen(PORT, async () => {
   console.log(`Backend v2 corriendo en puerto ${PORT} - AUTO 24/7 habilitado`);
   await initMongo();
   scheduleDailySummary();
-  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${formatArgTime(new Date())}\n💾 Persistencia: ${stateCollection ? 'MongoDB conectado ✅' : 'Solo memoria ⚠️'}\n🤖 Modo AUTO: ${state.autoMode ? 'Activo' : 'Inactivo'}`);
+  sendTelegram(`🟢 Signal Bot Backend v2 iniciado\n⏰ ${formatArgTime(new Date())}\n💾 Persistencia: ${stateCollection ? 'MongoDB conectado ✅' : 'Solo memoria ⚠️'}\n🤖 Modo AUTO: ${state.autoMode ? 'Activo' : 'Inactivo'}\n🔧 Modo de operación: ${String(state.tradingMode).toUpperCase()} · tamaño: ${SIZING_MODE === 'risk' ? `riesgo ${RISK_PER_TRADE_PCT}%` : 'fijo'}`);
+  checkModeBlockAndWarn(); // Fase 3a: si arranca bloqueado por modo, avisa enseguida
   // Start the auto-check loop (runs every 60 seconds regardless of browser)
   setInterval(runAutoCheck, 60000);
 });

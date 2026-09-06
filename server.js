@@ -6,6 +6,13 @@ const cors = require("cors");
 const crypto = require("crypto");
 const { MongoClient } = require("mongodb");
 const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por riesgo (solo backtest por ahora)
+// ── Fase 2: interruptor de tamaño para el VIVO (openTrade y manual) ──
+// 'fixed' = comportamiento de siempre (positionSizePct del capital, hoy 30%).
+// 'risk'  = módulo de riesgo: arriesga RISK_PER_TRADE_PCT del capital según la distancia al SL.
+// Se deploya en 'fixed' y se cambia a 'risk' a propósito, en un commit aparte, igual que AUTO_TRADING_LIVE_ENABLED.
+// Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
+const SIZING_MODE = 'fixed';
+const RISK_PER_TRADE_PCT = 0.75;
 
 // Formatea fecha/hora de Argentina a mano, sin depender de toLocaleString.
 // Esto evita bugs de compatibilidad si el servidor corre con soporte de
@@ -1254,7 +1261,19 @@ async function openTrade(pair, tf, analysis) {
       return;
     }
   }
-  const size = capitalBase * (pct / 100);
+  let size, riskUsd = null;
+  if (SIZING_MODE === 'risk') {
+    const r = calcPositionSize({ capital: capitalBase, entry: analysis.entry, sl: analysis.sl, overrides: { riskPerTradePct: RISK_PER_TRADE_PCT } });
+    if (!r.ok) {
+      console.log(`Módulo de riesgo: se saltea ${pair} — ${r.reason}`);
+      sendTelegram(`⚠️ Señal descartada por el módulo de riesgo en ${pair.replace('USDT','/USDT')}: ${r.reason}`);
+      return;
+    }
+    size = r.size; riskUsd = r.riskUsd;
+    console.log(`Módulo de riesgo: ${pair} compra $${r.size} (${r.exposurePct}% del capital), arriesga $${r.riskUsd}, SL a ${r.slDistPct}%${r.capped ? ' [topado por techo de exposición]' : ''}`);
+  } else {
+    size = capitalBase * (pct / 100);
+  }
   let qty = analysis.entry > 0 ? size / analysis.entry : 0;
   let realEntry = analysis.entry;
 
@@ -1281,6 +1300,7 @@ async function openTrade(pair, tf, analysis) {
   const trade = {
     id: Date.now() + '-' + pair, pair, signal: analysis.signal, direction: analysis.direction,
     entry: realEntry, tp: analysis.tp, sl: analysis.sl, qty, size, tf,
+    sizingMode: SIZING_MODE, riskUsd, // Fase 2: cuánto se arriesgó (null en modo fixed) — base del journal en R
     strategy: analysis.strategy || 'Reversión',
     // Mi aporte: si es Scalping, guardamos también CUÁL de las dos ramas
     // internas la abrió (siguiendo tendencia o apostando al rebote lateral) —
@@ -1415,7 +1435,8 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const commission = t.size * COMMISSION_PCT * 2;
   const pnl = pnlBeforeFees - commission;
   const pnlPct = (pnl / t.size) * 100;
-  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, closeTime: formatArgTime(new Date()), reason };
+  const rMultiple = t.riskUsd ? Math.round(pnl / t.riskUsd * 100) / 100 : null; // Fase 2: resultado en unidades de riesgo
+  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, rMultiple, closeTime: formatArgTime(new Date()), reason };
   state.trades.unshift(closed);
   if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
   state.capital += pnl;
@@ -2135,7 +2156,8 @@ app.get("/stats/all-modes", async (req, res) => {
 });
 
 app.get("/state", (req, res) => {
-  res.json(state);
+  // Fase 2: se expone la config de tamaño (constantes del código, no editables desde el panel)
+  res.json({ ...state, sizing: { mode: SIZING_MODE, riskPerTradePct: SIZING_MODE === 'risk' ? RISK_PER_TRADE_PCT : null, fixedPct: SIZING_MODE === 'fixed' ? (state.positionSizePct || 30) : null, autoTradingLiveEnabled: false } });
 });
 
 app.post("/state/config", async (req, res) => {
@@ -2239,8 +2261,16 @@ app.post("/state/open-manual-trade", async (req, res) => {
         return res.status(400).json({ error: `No se pudo leer el saldo real de ${state.tradingMode.toUpperCase()}: ${e.message}` });
       }
     }
-    const pct = sizePct || state.positionSizePct || 30;
-    size = capitalBase * (pct / 100);
+    let riskUsd = null;
+    if (SIZING_MODE === 'risk' && !sizePct) {
+      // Manual con módulo de riesgo (si el usuario manda sizePct explícito, se respeta el fijo)
+      const r = calcPositionSize({ capital: capitalBase, entry, sl, overrides: { riskPerTradePct: RISK_PER_TRADE_PCT } });
+      if (!r.ok) return res.status(400).json({ error: `Módulo de riesgo: ${r.reason}` });
+      size = r.size; riskUsd = r.riskUsd;
+    } else {
+      const pct = sizePct || state.positionSizePct || 30;
+      size = capitalBase * (pct / 100);
+    }
     qty = entry > 0 ? size / entry : 0;
 
     if (state.tradingMode !== 'demo') {
@@ -2263,6 +2293,7 @@ app.post("/state/open-manual-trade", async (req, res) => {
     const trade = {
       id: Date.now() + '-' + pair, pair, signal, direction: signal === 'COMPRAR' ? 'LARGO' : 'SHORT',
       entry, tp: parseFloat(tp), sl: parseFloat(sl), qty, size, tf: 'manual',
+      sizingMode: sizePct ? 'fixed' : SIZING_MODE, riskUsd, // Fase 2
       strategy: 'Manual', subStrategy: null, tp2: null, adxScale: 1.0,
       atr: Math.abs(entry - sl) / 1.5, peakPrice: entry,
       trailingActive: false, partialTaken: false, trendDisagreeCount: 0,

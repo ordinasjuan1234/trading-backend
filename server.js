@@ -2512,7 +2512,7 @@ async function sendDailySummaryMsg() {
       const { closes: c4, highs: h4, lows: l4 } = await fetchKlines(pair, '4h', 60);
       const adx = calcADX(h4, l4, c4, 14);
       const adxNum = typeof adx === 'number' ? adx : (adx && typeof adx.adx === 'number' ? adx.adx : null);
-      adxLines += `\n   ${pair.replace('USDT', '')}: ADX 4h ${adxNum !== null ? adxNum.toFixed(1) : 'n/d'} ${adxNum !== null ? (adxNum >= 25 ? '✅ habilita' : '⏸ < 25, sin tendencia') : ''}`;
+      adxLines += `\n   ${pair.replace('USDT', '')}: ADX 4h ${adxNum !== null ? adxNum.toFixed(1) : 'n/d'} ${adxNum !== null ? (adxNum >= 25 ? '✅ habilita' : '⏸ menor a 25, sin tendencia') : ''}`;
     } catch (e) { adxLines += `\n   ${pair.replace('USDT', '')}: ADX 4h error (${e.message})`; }
   }
   const bloqueado = autoTradingBlockedByMode() ? '\n⚠️ AUTO-TRADING BLOQUEADO: modo ≠ demo' : '';

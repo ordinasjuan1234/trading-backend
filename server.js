@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const { MongoClient } = require("mongodb");
+const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por riesgo (solo backtest por ahora)
 
 // Formatea fecha/hora de Argentina a mano, sin depender de toLocaleString.
 // Esto evita bugs de compatibilidad si el servidor corre con soporte de
@@ -2884,7 +2885,7 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
 
   let capital = initialCapital, trades = [], peakCapital = initialCapital, maxDrawdown = 0;
   let closedByReason = {};
-  let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0, signalsSkippedByRegime = 0, signalsSkippedByAdx = 0;
+  let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0, signalsSkippedByRegime = 0, signalsSkippedByAdx = 0, signalsSkippedBySizing = 0;
   const MIN_HISTORY = 60;
   let p4h = 0;
 
@@ -2913,7 +2914,16 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     // Resolver la operación vela a vela en el mismo timeframe principal —
     // SL/TP fijos, estructurales, sin trailing ni límite de tiempo (a propósito).
     const entry = a.entry, tp = a.tp, sl = a.sl, signal = a.signal;
-    const size = capital * riskPct;
+    // Tamaño: 'fixed' = comportamiento de siempre (capital × riskPct);
+    // 'risk' = módulo de riesgo (risk.js): arriesga riskPerTradePct del capital según la distancia al SL.
+    let size, riskUsd = null;
+    if (config.sizingMode === 'risk') {
+      const r = calcPositionSize({ capital, entry, sl, overrides: { riskPerTradePct: config.riskPerTradePct ?? 0.5 } });
+      if (!r.ok) { signalsSkippedBySizing++; continue; }
+      size = r.size; riskUsd = r.riskUsd;
+    } else {
+      size = capital * riskPct;
+    }
     let exitPrice = null, reason = null;
     const MAX_BARS = 96; // ~2 días en 30m como límite de seguridad, no de gestión activa
     let barsOpen = 0;
@@ -2936,7 +2946,7 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     const commission = size * COMMISSION_PCT * 2;
     const pnl = grossPnl - commission;
     capital += pnl;
-    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h });
+    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h, size: Math.round(size * 100) / 100, riskUsd, rMultiple: riskUsd ? Math.round(pnl / riskUsd * 100) / 100 : null });
     closedByReason[reason] = (closedByReason[reason] || 0) + 1;
     if (capital > peakCapital) peakCapital = capital;
     const dd = (peakCapital - capital) / peakCapital;
@@ -2946,7 +2956,10 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
   const wins = trades.filter(t => t.pnl > 0).length;
   const losses = trades.filter(t => t.pnl < 0).length;
   const totalPnl = capital - initialCapital;
+  const rTrades = trades.filter(t => t.rMultiple !== null);
+  const expectancyR = rTrades.length ? (rTrades.reduce((s, t) => s + t.rMultiple, 0) / rTrades.length).toFixed(3) : null;
   return {
+    sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing },
     trades: trades.length, wins, losses,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
     finalCapital: capital.toFixed(2),
@@ -3376,7 +3389,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy, sizingMode, riskPerTradePct } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
       const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, onlySubStrategy });
@@ -3397,10 +3410,10 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct });
       return res.json({
         success: true,
-        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora' },
+        config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },
         dataRange: { note: 'Entrada nueva por estructura (régimen 4h + ruptura de swing en ' + tf + ', SL/TP estructurales fijos, sin trailing/breakeven) — ver candlesUsed en el resultado' },
         result
       });

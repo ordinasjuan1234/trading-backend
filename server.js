@@ -3006,7 +3006,12 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
       size = capital * riskPct;
     }
     let exitPrice = null, reason = null;
-    const MAX_BARS = 96; // ~2 días en 30m como límite de seguridad, no de gestión activa
+    // Límite de tiempo configurable (config.maxHours, default 48 = lo validado). Si config.loserExtendHours
+    // está seteado, replica la regla del VIVO: al llegar al límite, si la operación va perdiendo se extiende
+    // hasta loserExtendHours (en vivo: 48 h, o 144 h si va perdiendo).
+    const barsPerHour = tf === '15m' ? 4 : tf === '30m' ? 2 : tf === '1h' ? 1 : 0.25;
+    const MAX_BARS = Math.max(2, Math.round((config.maxHours || 48) * barsPerHour));
+    const EXT_BARS = config.loserExtendHours ? Math.round(config.loserExtendHours * barsPerHour) : MAX_BARS;
     let barsOpen = 0;
     // Slippage (castigo de ejecución real, config.slippagePct en %, default 0 = comportamiento de siempre):
     // la entrada a mercado en una ruptura se llena PEOR; el SL a mercado se llena PEOR; el TP se asume
@@ -3014,7 +3019,8 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     const slip = (config.slippagePct || 0) / 100;
     const dir = signal === 'COMPRAR' ? 1 : -1;
     const entryFill = entry * (1 + dir * slip);
-    for (let j = i + 1; j < candlesMain.length && barsOpen < MAX_BARS; j++) {
+    let extended = false;
+    for (let j = i + 1; j < candlesMain.length && barsOpen < (extended ? EXT_BARS : MAX_BARS); j++) {
       const c = candlesMain[j];
       barsOpen++;
       if (signal === 'COMPRAR') {
@@ -3024,7 +3030,13 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
         if (c.high >= sl) { exitPrice = sl * (1 + slip); reason = 'SL estructural'; break; }
         if (c.low <= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
       }
-      if (barsOpen === MAX_BARS - 1) { exitPrice = c.close * (1 - dir * slip); reason = 'Cierre por tiempo (2 días, sin resolver)'; }
+      // (misma mecánica que antes: se fija el cierre en la anteúltima vela del límite; la última vela todavía puede resolver por SL/TP)
+      if (barsOpen === MAX_BARS - 1 && !extended) {
+        const losing = signal === 'COMPRAR' ? c.close < entry : c.close > entry;
+        if (EXT_BARS > MAX_BARS && losing) { extended = true; continue; } // regla del vivo: perdedora se extiende
+        exitPrice = c.close * (1 - dir * slip); reason = 'Cierre por tiempo (sin resolver)';
+      }
+      if (extended && barsOpen === EXT_BARS - 1) { exitPrice = c.close * (1 - dir * slip); reason = 'Cierre por tiempo (extendida, sin resolver)'; }
     }
     if (exitPrice === null) continue;
 
@@ -3047,7 +3059,7 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
   const rTrades = trades.filter(t => t.rMultiple !== null);
   const expectancyR = rTrades.length ? (rTrades.reduce((s, t) => s + t.rMultiple, 0) / rTrades.length).toFixed(3) : null;
   return {
-    sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing, slippagePct: config.slippagePct || 0 },
+    sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing, slippagePct: config.slippagePct || 0, maxHours: config.maxHours || 48, loserExtendHours: config.loserExtendHours || null },
     pnlByReason,
     trades: trades.length, wins, losses,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
@@ -3478,7 +3490,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy, sizingMode, riskPerTradePct, slippagePct } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
       const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, onlySubStrategy });
@@ -3499,7 +3511,7 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours });
       return res.json({
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },
@@ -3559,4 +3571,3 @@ app.listen(PORT, async () => {
   // Start the auto-check loop (runs every 60 seconds regardless of browser)
   setInterval(runAutoCheck, 60000);
 });
-

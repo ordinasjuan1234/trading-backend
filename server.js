@@ -2965,6 +2965,7 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
 
   let capital = initialCapital, trades = [], peakCapital = initialCapital, maxDrawdown = 0;
   let closedByReason = {};
+  const pnlByReason = {};
   let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0, signalsSkippedByRegime = 0, signalsSkippedByAdx = 0, signalsSkippedBySizing = 0;
   const MIN_HISTORY = 60;
   let p4h = 0;
@@ -3007,27 +3008,34 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     let exitPrice = null, reason = null;
     const MAX_BARS = 96; // ~2 días en 30m como límite de seguridad, no de gestión activa
     let barsOpen = 0;
+    // Slippage (castigo de ejecución real, config.slippagePct en %, default 0 = comportamiento de siempre):
+    // la entrada a mercado en una ruptura se llena PEOR; el SL a mercado se llena PEOR; el TP se asume
+    // exacto (orden límite); el cierre por tiempo a mercado también se llena peor.
+    const slip = (config.slippagePct || 0) / 100;
+    const dir = signal === 'COMPRAR' ? 1 : -1;
+    const entryFill = entry * (1 + dir * slip);
     for (let j = i + 1; j < candlesMain.length && barsOpen < MAX_BARS; j++) {
       const c = candlesMain[j];
       barsOpen++;
       if (signal === 'COMPRAR') {
-        if (c.low <= sl) { exitPrice = sl; reason = 'SL estructural'; break; }
+        if (c.low <= sl) { exitPrice = sl * (1 - slip); reason = 'SL estructural'; break; }
         if (c.high >= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
       } else {
-        if (c.high >= sl) { exitPrice = sl; reason = 'SL estructural'; break; }
+        if (c.high >= sl) { exitPrice = sl * (1 + slip); reason = 'SL estructural'; break; }
         if (c.low <= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
       }
-      if (barsOpen === MAX_BARS - 1) { exitPrice = c.close; reason = 'Cierre por tiempo (2 días, sin resolver)'; }
+      if (barsOpen === MAX_BARS - 1) { exitPrice = c.close * (1 - dir * slip); reason = 'Cierre por tiempo (2 días, sin resolver)'; }
     }
     if (exitPrice === null) continue;
 
-    const pricePct = signal === 'COMPRAR' ? (exitPrice - entry) / entry : (entry - exitPrice) / entry;
+    const pricePct = signal === 'COMPRAR' ? (exitPrice - entryFill) / entryFill : (entryFill - exitPrice) / entryFill;
     const grossPnl = size * pricePct;
     const commission = size * COMMISSION_PCT * 2;
     const pnl = grossPnl - commission;
     capital += pnl;
     trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h, size: Math.round(size * 100) / 100, riskUsd, rMultiple: riskUsd ? Math.round(pnl / riskUsd * 100) / 100 : null });
     closedByReason[reason] = (closedByReason[reason] || 0) + 1;
+    pnlByReason[reason] = Math.round(((pnlByReason[reason] || 0) + pnl) * 100) / 100; // P&L separado por tipo de cierre (SL / TP / tiempo)
     if (capital > peakCapital) peakCapital = capital;
     const dd = (peakCapital - capital) / peakCapital;
     if (dd > maxDrawdown) maxDrawdown = dd;
@@ -3039,7 +3047,8 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
   const rTrades = trades.filter(t => t.rMultiple !== null);
   const expectancyR = rTrades.length ? (rTrades.reduce((s, t) => s + t.rMultiple, 0) / rTrades.length).toFixed(3) : null;
   return {
-    sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing },
+    sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing, slippagePct: config.slippagePct || 0 },
+    pnlByReason,
     trades: trades.length, wins, losses,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
     finalCapital: capital.toFixed(2),
@@ -3469,7 +3478,7 @@ function runBacktestEngine(candles, config) {
 }
 
 app.post("/backtest", async (req, res) => {
-  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy, sizingMode, riskPerTradePct } = req.body;
+  const { pair = 'BTCUSDT', tf = '15m', days = 30, minConfidence = 70, riskPct = 0.20, initialCapital = 1000, strategy = 'original', timeLimitMultiplier = 1.0, tpVariant = 'default', disableTrailing = false, noTimeLimit = false, earlyBreakeven = false, breakevenTriggerAtr, trailDistanceAtr, requireStructure = false, peakGiveback = false, peakGivebackPct, peakGivebackMinAtr, shortTf, endDate, minAdx4h, onlySubStrategy, sizingMode, riskPerTradePct, slippagePct } = req.body;
   try {
     if (strategy === 'scalping-realistic') {
       const result = await runScalpingRealisticBacktest(pair, days, { minConfidence, riskPct, initialCapital, earlyBreakeven, breakevenTriggerAtr, onlySubStrategy });
@@ -3490,7 +3499,7 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct });
       return res.json({
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },
@@ -3550,3 +3559,4 @@ app.listen(PORT, async () => {
   // Start the auto-check loop (runs every 60 seconds regardless of browser)
   setInterval(runAutoCheck, 60000);
 });
+

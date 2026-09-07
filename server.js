@@ -2516,7 +2516,7 @@ async function sendDailySummaryMsg() {
   const now = formatArgTime(new Date());
   // Fase 3a: estado del sistema + ADX 4h de cada par, para saber cada mañana POR QUÉ operó o no operó
   let adxLines = '';
-  for (const pair of ['BTCUSDT', 'ETHUSDT']) {
+  for (const pair of (state.autoPairs && state.autoPairs.length ? state.autoPairs : ['BTCUSDT', 'ETHUSDT'])) {
     try {
       const { closes: c4, highs: h4, lows: l4 } = await fetchKlines(pair, '4h', 60);
       const adx = calcADX(h4, l4, c4, 14);

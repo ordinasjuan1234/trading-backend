@@ -1909,47 +1909,16 @@ async function runAutoCheckInner() {
   let allSignals = [];
   for (const pair of freePairs) {
     let signals = [];
-    for (const tf of state.autoTFs) {
-      try {
-        // Improved strategy needs more history (210 candles) for SMA200 trend filter
-        const { closes, highs, lows } = await fetchKlines(pair, tf, 220);
-        // Reversión PAUSADA desde el 30/7 — Tendencia se reactiva el 31/7,
-        // corriendo específicamente en 30m (no 1h/4h como antes) — término
-        // medio real entre los 15-30 min de Scalping/Rebote y las 8+ horas
-        // que llegaba a tardar Tendencia en 1h/4h.
-        // const a = analyzeImproved(closes, highs, lows);
-        // if (a) signals.push({ tf, pair, signal: a.signal, confidence: a.confidence, analysis: a });
-        // Tendencia PAUSADA (31/8/2026) — todos los backtests anteriores
-        // (los que validaron ADX≥25, breakeven 1.5x, trailing 0.6x) corrían
-        // sin querer en 4h, no en 30m/15m que es lo que este loop realmente
-        // opera — faltaba "30m" en el mapeo de timeframes del backtest y
-        // devolvía 0 velas en silencio. Corregido el bug y repetido el
-        // backtest de 60 días YA en 30m (el timeframe real): 97 operaciones,
-        // bruto de apenas +$0.49 — sin filo direccional real, más allá de
-        // cualquier costo. Neto -$55.70 (-5.57%). Coincide con lo que se
-        // venía viendo en vivo (42-54% de aciertos, neto negativo). No se
-        // sigue operando con una entrada sin filo confirmado — la sigue
-        // vigilando el sistema por si hace falta cerrar algo abierto, pero
-        // no abre operaciones nuevas hasta rediseñar la entrada (estructura
-        // de mercado, no solo EMA+ADX+nube).
-        // const b = analyzeTrendFollowAdx25(closes, highs, lows);
-        // if (b && b.signal !== 'NEUTRO') {
-        //   const goodEntry = await checkGoodEntry15m(pair, b.direction);
-        //   if (goodEntry) {
-        //     signals.push({ tf, pair, signal: b.signal, confidence: b.confidence, analysis: b });
-        //   } else {
-        //     console.log(`${pair} ${tf} Tendencia ${b.signal} bloqueada — precio muy estirado en 15m, probable entrada tardía`);
-        //   }
-        // }
-        // Rango PAUSADA desde el 30/7 — 13.3% de aciertos en 15 operaciones reales,
-        // evidencia clara de que el diagnóstico "ADX bajo = mercado lateral" no
-        // alcanza para detectar un rango operable de verdad. Queda el código
-        // intacto para cuando se rediseñe (agregar confirmación de que el precio
-        // realmente viene rebotando entre piso y techo, no solo ADX bajo).
-        // const c = analyzeRango(closes, highs, lows);
-        // if (c) signals.push({ tf, pair, signal: c.signal, confidence: c.confidence, analysis: c });
-      } catch (e) { console.log(`Analyze error ${pair} ${tf}:`, e.message); }
-    }
+    // (12/9/2026) Se sacó el fetch de velas 30m/15m/1h que alimentaba a
+    // Tendencia y Rango — ambas pausadas y comentadas desde hace semanas.
+    // El pedido a Binance se seguía haciendo igual, sin que nadie usara el
+    // resultado: 3 pedidos desperdiciados por par, 27 en total con 9 pares,
+    // antes incluso de llegar a la Estructura (2 pedidos más por par). Con
+    // ADA/DOGE/LINK/AVAX al final de la lista, esto probablemente los hacía
+    // toparse con el límite de pedidos por minuto de Binance más seguido que
+    // a BTC/ETH — backtest confirmó (12/9) que ADA tuvo 31 señales reales en
+    // 7-9/9 que el bot en vivo nunca ejecutó. Si en algún momento se
+    // rediseña Tendencia o Rango, este fetch hay que traerlo de vuelta.
 
     // Entrada por Estructura (1/9/2026, ajustada 4/9/2026) — CONECTADA al
     // auto-trading en vivo, validada cross-asset out-of-sample (BTC y ETH,

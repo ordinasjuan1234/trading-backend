@@ -60,6 +60,22 @@ function formatArgTime(date) {
   return `${day}/${month}/${year}, ${hh}:${mm}:${ss}`;
 }
 
+// (Fase de medición, 19/9/2026) Formato de precio con precisión según la
+// magnitud — antes todo usaba .toFixed(2) en los mensajes de Telegram, lo
+// que hacía que monedas chicas (DOGE, etc.) mostraran entrada/TP/SL
+// redondeados al mismo valor visible ($0.09/$0.09/$0.08-0.09),
+// imposibilitando verificar los niveles a simple vista. Solo cambia cómo
+// se MUESTRA el número — el valor guardado en la base de datos siempre
+// tuvo precisión completa, esto no toca ningún cálculo.
+function formatPrice(p) {
+  if (p === undefined || p === null || isNaN(p)) return 'n/d';
+  const abs = Math.abs(p);
+  if (abs >= 100) return p.toFixed(2);
+  if (abs >= 1) return p.toFixed(4);
+  if (abs >= 0.01) return p.toFixed(6);
+  return p.toFixed(8);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -1308,6 +1324,14 @@ async function openTrade(pair, tf, analysis) {
   let qty = analysis.entry > 0 ? size / analysis.entry : 0;
   let realEntry = analysis.entry;
 
+  // (Fase de medición, 19/9/2026) Contexto de la cartera AL MOMENTO de abrir
+  // — cuántas posiciones ya había abiertas, cuáles eran, y la exposición
+  // total resultante. Solo mide, no bloquea ni cambia nada de la apertura.
+  const positionsOpenAtEntry = state.openTrades.length;
+  const pairsOpenAtEntry = state.openTrades.map(x => x.pair);
+  const existingExposureUsd = state.openTrades.reduce((s, x) => s + (x.size || 0), 0);
+  const totalExposureAtEntryPct = capitalBase > 0 ? ((existingExposureUsd + size) / capitalBase) * 100 : null;
+
   // ── Ejecución real (Testnet/Real): abre la posición de verdad en Binance ──
   if (state.tradingMode !== 'demo' && !state.killSwitchActive) {
     qty = roundQtyForBinance(pair, qty);
@@ -1350,7 +1374,26 @@ async function openTrade(pair, tf, analysis) {
     trendDisagreeCount: 0,
     openTime: formatArgTime(new Date()),
     openTimestamp: Date.now(),
-    confidence: analysis.confidence, auto: true
+    confidence: analysis.confidence, auto: true,
+    // (Fase de medición, 19/9/2026) — campos nuevos, solo para poder analizar
+    // después. No participan de ninguna decisión de entrada, tamaño ni salida.
+    capitalAtOpen: capitalBase,
+    exposurePct: capitalBase > 0 ? (size / capitalBase) * 100 : null,
+    positionsOpenAtEntry,
+    pairsOpenAtEntry,
+    totalExposureAtEntryPct,
+    adx4h: analysis.adx4h !== undefined ? analysis.adx4h : null,
+    regime4h: analysis.regime4h || null,
+    // La confianza de Estructura es un valor fijo por diseño (no una suma de
+    // componentes) — lo dejamos anotado explícitamente para que el journal
+    // futuro no asuma que hay un desglose real detrás del número.
+    confidenceNote: (analysis.strategy === 'Estructura') ? 'Valor fijo (75) por diseño — no es un compuesto de componentes' : null,
+    // Máximo movimiento favorable/adverso — arrancan en la entrada, se van
+    // actualizando cada 60s mientras la operación esté abierta (ver el loop
+    // de vigilancia). Sirven para saber, al cerrar, qué tanto llegó a estar
+    // a favor o en contra antes del resultado final.
+    maxFavorablePrice: realEntry,
+    maxAdversePrice: realEntry
   };
   state.openTrades.push(trade);
   await saveState(state);
@@ -1366,7 +1409,11 @@ async function openTrade(pair, tf, analysis) {
   const structInfo = (analysis.adx4h !== undefined && analysis.adx4h !== null)
     ? `\n📐 ADX 4h: ${analysis.adx4h.toFixed(1)} (régimen: ${analysis.regime4h})`
     : '';
-  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}${regimeInfo}${structInfo}\n💵 Entrada: $${realEntry.toFixed(2)}\n🎯 TP: $${analysis.tp.toFixed(2)}\n🛑 SL: $${analysis.sl.toFixed(2)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: ${pct}% del capital`);
+  // (Fase de medición) contexto de exposición, solo informativo en el mensaje.
+  const exposureInfo = positionsOpenAtEntry > 0
+    ? `\n📦 Posiciones ya abiertas al entrar: ${positionsOpenAtEntry} (${pairsOpenAtEntry.join(', ')}) · exposición total tras esta: ${totalExposureAtEntryPct !== null ? totalExposureAtEntryPct.toFixed(1) : 'n/d'}%`
+    : '';
+  sendTelegram(`${emoji} ${analysis.signal} AUTO (Servidor)\n📊 ${pair.replace('USDT','/USDT')} · ${tf.toUpperCase()}\n🧠 Estrategia: ${trade.strategy}${cloudInfo}${volInfo}${adxInfo}${regimeInfo}${structInfo}${exposureInfo}\n💵 Entrada: $${formatPrice(realEntry)}\n🎯 TP: $${formatPrice(analysis.tp)}\n🛑 SL: $${formatPrice(analysis.sl)}\n📊 R/R: 1:${analysis.rr.toFixed(2)}\n🎯 Confianza: ${analysis.confidence}%\n💰 Tamaño: $${size.toFixed(2)} (${trade.exposurePct !== null ? trade.exposurePct.toFixed(1) : 'n/d'}% del capital)`);
 }
 
 // Toma de ganancia parcial: cierra el 50% de la posición asegurando esa ganancia,
@@ -1467,7 +1514,24 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const pnl = pnlBeforeFees - commission;
   const pnlPct = (pnl / t.size) * 100;
   const rMultiple = t.riskUsd ? Math.round(pnl / t.riskUsd * 100) / 100 : null; // Fase 2: resultado en unidades de riesgo
-  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, rMultiple, closeTime: formatArgTime(new Date()), reason };
+  const closeTimestamp = Date.now();
+  // (Fase de medición, 19/9/2026) Duración real y MFE/MAE — cuánto llegó a
+  // estar a favor (máximo movimiento favorable) y en contra (máximo
+  // movimiento adverso) durante toda la vida de la operación, no solo el
+  // resultado final. Si por algún motivo no se llegó a trackear (trades
+  // viejos, de antes de este cambio), queda null en vez de un número falso.
+  const durationMinutes = t.openTimestamp ? Math.round((closeTimestamp - t.openTimestamp) / 60000) : null;
+  let mfePct = null, maePct = null;
+  if (t.maxFavorablePrice !== undefined && t.maxAdversePrice !== undefined) {
+    if (t.signal === 'COMPRAR') {
+      mfePct = ((t.maxFavorablePrice - t.entry) / t.entry) * 100;
+      maePct = ((t.entry - t.maxAdversePrice) / t.entry) * 100;
+    } else {
+      mfePct = ((t.entry - t.maxFavorablePrice) / t.entry) * 100;
+      maePct = ((t.maxAdversePrice - t.entry) / t.entry) * 100;
+    }
+  }
+  const closed = { ...t, exitPrice, pnl, pnlPct, pnlBeforeFees, commission, rMultiple, closeTime: formatArgTime(new Date()), closeTimestamp, durationMinutes, mfePct, maePct, reason };
   state.trades.unshift(closed);
   if (state.trades.length > 500) state.trades = state.trades.slice(0, 500);
   state.capital += pnl;
@@ -1494,7 +1558,7 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   state.openTrades.splice(idx, 1);
   await saveState(state);
   const emoji = pnl >= 0 ? '✅' : '❌';
-  sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${t.entry.toFixed(2)} → $${exitPrice.toFixed(2)}\n${pnl>=0?'💰':'📉'} PnL neto: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n💸 Comisión simulada: -$${commission.toFixed(2)}\n🏷 ${reason}\n💰 Capital: $${state.capital.toFixed(2)}`);
+  sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${formatPrice(t.entry)} → $${formatPrice(exitPrice)}\n${pnl>=0?'💰':'📉'} PnL neto: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n💸 Comisión simulada: -$${commission.toFixed(2)}\n🏷 ${reason}${durationMinutes !== null ? `\n⏱ Duración: ${durationMinutes < 60 ? durationMinutes + ' min' : (durationMinutes/60).toFixed(1) + ' hs'}` : ''}${mfePct !== null ? `\n📈 Máx. a favor: ${mfePct.toFixed(2)}% · Máx. en contra: ${maePct.toFixed(2)}%` : ''}\n💰 Capital: $${state.capital.toFixed(2)}`);
   if (state.consecutiveLosses >= 3) {
     sendTelegram(`⚠️ BOT PAUSADO (Servidor)\n3 pérdidas seguidas\n🛡 Capital protegido: $${state.capital.toFixed(2)}`);
     state.autoMode = false;
@@ -1560,7 +1624,11 @@ async function checkGhostTrades() {
         if (state.ghostResults.length > 200) state.ghostResults = state.ghostResults.slice(0, 200);
         await saveState(state);
         const habriaGanado = hypotheticalPnl >= 0;
-        sendTelegram(`👻 RESULTADO FANTASMA (Sub-SL)\n${g.pair.replace('USDT','/USDT')} · ${g.tf} · ${g.strategy}\nSi NO hubiéramos cortado esta operación, habría cerrado en ${resolved} con ${habriaGanado ? 'GANANCIA' : 'PÉRDIDA'} hipotética de ${hypotheticalPnl>=0?'+':''}$${hypotheticalPnl.toFixed(2)}\n(Esto es solo comparación — no afectó tu capital real)`);
+        // (Fase de medición, 19/9/2026) El origen puede ser Sub-SL (comportamiento
+        // original) o "tiempo" (cierre por vencimiento de plazo, agregado ahora) —
+        // el mensaje lo indica explícitamente en vez de asumir siempre Sub-SL.
+        const origenTexto = g.ghostOrigin === 'tiempo' ? 'Cierre por tiempo' : 'Sub-SL';
+        sendTelegram(`👻 RESULTADO FANTASMA (${origenTexto})\n${g.pair.replace('USDT','/USDT')} · ${g.tf} · ${g.strategy}\nSi NO hubiéramos cortado esta operación, habría cerrado en ${resolved} con ${habriaGanado ? 'GANANCIA' : 'PÉRDIDA'} hipotética de ${hypotheticalPnl>=0?'+':''}$${hypotheticalPnl.toFixed(2)}\n(Esto es solo comparación — no afectó tu capital real)`);
       }
     } catch (e) { console.log('Ghost check error:', e.message); }
   }
@@ -1610,6 +1678,23 @@ async function runAutoCheckInner() {
       const currentPrice = closes[closes.length - 1];
       const recentHigh = Math.max(...highs);
       const recentLow = Math.min(...lows);
+
+      // (Fase de medición, 19/9/2026) MFE/MAE universal — a diferencia del
+      // peakPrice de más abajo (que solo se actualiza para las estrategias
+      // con trailing activo), esto corre SIEMPRE, para cualquier operación
+      // abierta, incluida Estructura (que no tiene trailing). Solo mide, no
+      // toca SL/TP ni ninguna decisión de cierre.
+      if (t.maxFavorablePrice === undefined) t.maxFavorablePrice = t.entry;
+      if (t.maxAdversePrice === undefined) t.maxAdversePrice = t.entry;
+      let mfeMaeChanged = false;
+      if (t.signal === 'COMPRAR') {
+        if (recentHigh > t.maxFavorablePrice) { t.maxFavorablePrice = recentHigh; mfeMaeChanged = true; }
+        if (recentLow < t.maxAdversePrice) { t.maxAdversePrice = recentLow; mfeMaeChanged = true; }
+      } else {
+        if (recentLow < t.maxFavorablePrice) { t.maxFavorablePrice = recentLow; mfeMaeChanged = true; }
+        if (recentHigh > t.maxAdversePrice) { t.maxAdversePrice = recentHigh; mfeMaeChanged = true; }
+      }
+      if (mfeMaeChanged) await saveState(state);
 
       // ── Trailing stop: asegura ganancia moviendo el SL a favor cuando la
       // operación viene ganando, sin retroceder nunca a un SL peor que el anterior.
@@ -1878,8 +1963,23 @@ async function runAutoCheckInner() {
         const closeNow = (TIME_LIMIT_MODE === 'validated' && t.strategy === 'Estructura') || !inLoss || hitHardCap; // Fase 2b
         if (closeNow) {
           const reason = hitHardCap && inLoss ? `Cierre por tiempo (límite duro ${HARD_MAX_HOURS_OPEN}hs, seguía en pérdida)` : `Cierre por tiempo (${MAX_HOURS_OPEN}hs)`;
+          // (Fase de medición, 19/9/2026) Seguimiento fantasma para cierres
+          // por tiempo — reusa el mismo mecanismo que ya existía para Sub-SL
+          // (checkGhostTrades). t.tp/t.sl siguen siendo los originales acá
+          // (Estructura no tiene trailing/breakeven que los mueva), así que
+          // sirven tal cual para saber después si el precio hubiera tocado
+          // primero el TP o el SL de no haber cortado por tiempo.
+          if (!state.ghostTrades) state.ghostTrades = [];
+          state.ghostTrades.push({
+            id: t.id + '-ghost-tiempo-' + Date.now(),
+            pair: t.pair, signal: t.signal, direction: t.direction, tf: t.tf, strategy: t.strategy,
+            entry: t.entry, tp: t.tp, sl: t.sl, size: t.size,
+            realExitPrice: currentPrice,
+            ghostStartTimestamp: Date.now(),
+            ghostOrigin: 'tiempo'
+          });
           await closeTradeById(t.id, currentPrice, reason);
-          sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba ${hoursOpen.toFixed(2)}hs abierta sin tocar TP/SL${hitHardCap && inLoss ? ' (esperó hasta el límite duro, seguía en pérdida)' : ''}\nSe cerró al precio de mercado para liberar el capital.`);
+          sendTelegram(`⏰ OPERACIÓN CERRADA POR TIEMPO\n${t.pair.replace('USDT','/USDT')} llevaba ${hoursOpen.toFixed(2)}hs abierta sin tocar TP/SL${hitHardCap && inLoss ? ' (esperó hasta el límite duro, seguía en pérdida)' : ''}\nSe cerró al precio de mercado para liberar el capital.\n👻 Arrancamos un seguimiento fantasma para ver si hubiera tocado TP o SL después.`);
         }
       }
     } catch (e) { console.log('Check open trade error:', e.message); }
@@ -2153,6 +2253,89 @@ app.get("/stats/all-modes", async (req, res) => {
       };
     }
     res.json({ success: true, stats: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// (Fase de medición, 19/9/2026) Desglose detallado de Estructura — solo lee
+// state.trades, no calcula nada nuevo en el momento de operar ni cambia
+// ninguna decisión. Los campos nuevos (adx4h, positionsOpenAtEntry, MFE/MAE,
+// etc.) solo existen en operaciones cerradas DESPUÉS de este cambio — las
+// viejas van a aparecer con esos campos en null/"sin dato", lo cual es
+// correcto: no se puede reconstruir ese contexto retroactivamente.
+app.get("/stats/estructura-detail", (req, res) => {
+  try {
+    const trades = (state.trades || []).filter(t => t.strategy === 'Estructura');
+    if (trades.length === 0) return res.json({ success: true, note: 'Todavía no hay operaciones cerradas de Estructura.', trades: 0 });
+
+    const agg = (list) => {
+      const wins = list.filter(t => t.pnl > 0).length;
+      const losses = list.filter(t => t.pnl < 0).length;
+      const netPnl = list.reduce((s, t) => s + t.pnl, 0);
+      return {
+        trades: list.length, wins, losses,
+        winRate: list.length ? ((wins / list.length) * 100).toFixed(1) : '0',
+        netPnl: Math.round(netPnl * 100) / 100
+      };
+    };
+
+    // Por par
+    const byPair = {};
+    for (const t of trades) {
+      if (!byPair[t.pair]) byPair[t.pair] = [];
+      byPair[t.pair].push(t);
+    }
+    const byPairStats = {};
+    for (const p in byPair) byPairStats[p] = agg(byPair[p]);
+
+    // Por rango de ADX 4h (solo trades que tienen el dato guardado)
+    const withAdx = trades.filter(t => typeof t.adx4h === 'number');
+    const adxBuckets = { '25-30': [], '30-35': [], '35-40': [], '>40': [] };
+    for (const t of withAdx) {
+      if (t.adx4h < 30) adxBuckets['25-30'].push(t);
+      else if (t.adx4h < 35) adxBuckets['30-35'].push(t);
+      else if (t.adx4h < 40) adxBuckets['35-40'].push(t);
+      else adxBuckets['>40'].push(t);
+    }
+    const adxStats = {};
+    for (const b in adxBuckets) adxStats[b] = agg(adxBuckets[b]);
+    if (trades.length !== withAdx.length) adxStats['sin_dato_adx4h'] = agg(trades.filter(t => typeof t.adx4h !== 'number'));
+
+    // Por motivo de cierre (agrupa variantes de "Cierre por tiempo..." en un solo bucket)
+    const byReason = {};
+    for (const t of trades) {
+      const key = t.reason && t.reason.startsWith('Cierre por tiempo') ? 'Cierre por tiempo' : (t.reason || 'sin_dato');
+      if (!byReason[key]) byReason[key] = [];
+      byReason[key].push(t);
+    }
+    const reasonStats = {};
+    for (const r in byReason) reasonStats[r] = agg(byReason[r]);
+
+    // Una posición vs. varias simultáneas al momento de entrar
+    const withPositionsData = trades.filter(t => typeof t.positionsOpenAtEntry === 'number');
+    const single = withPositionsData.filter(t => t.positionsOpenAtEntry === 0);
+    const multi = withPositionsData.filter(t => t.positionsOpenAtEntry > 0);
+    const positionStats = { unica: agg(single), simultanea: agg(multi) };
+    if (trades.length !== withPositionsData.length) positionStats['sin_dato'] = agg(trades.filter(t => typeof t.positionsOpenAtEntry !== 'number'));
+
+    // MFE/MAE promedio (solo donde hay dato)
+    const withMfeMae = trades.filter(t => typeof t.mfePct === 'number' && typeof t.maePct === 'number');
+    const mfeMaeAvg = withMfeMae.length ? {
+      mfePromedioPct: (withMfeMae.reduce((s, t) => s + t.mfePct, 0) / withMfeMae.length).toFixed(2),
+      maePromedioPct: (withMfeMae.reduce((s, t) => s + t.maePct, 0) / withMfeMae.length).toFixed(2),
+      muestras: withMfeMae.length
+    } : { note: 'Sin datos de MFE/MAE todavía (solo trades cerrados después del 19/9/2026 lo tienen)' };
+
+    res.json({
+      success: true,
+      total: agg(trades),
+      porPar: byPairStats,
+      porRangoAdx4h: adxStats,
+      porMotivoCierre: reasonStats,
+      unicaVsSimultanea: positionStats,
+      mfeMae: mfeMaeAvg
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

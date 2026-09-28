@@ -76,6 +76,113 @@ function formatPrice(p) {
   return p.toFixed(8);
 }
 
+
+// ══ Fase de medición 2 (27/9/2026) — helpers puros (sin tocar estado ni operar) ══
+
+// Parsea el texto de hora que guarda el bot ("d/m/yyyy, hh:mm:ss", hora Argentina
+// UTC-3 fija) a milisegundos UTC. Sirve para las operaciones viejas, que no
+// tienen closeTimestamp guardado (solo lo tienen las cerradas desde el 20/9).
+function parseArgTimeToMs(str) {
+  if (typeof str !== 'string') return null;
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),\s*(\d{1,2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const [, d, mo, y, hh, mm, ss] = m.map(Number);
+  return Date.UTC(y, mo - 1, d, hh + 3, mm, ss);
+}
+
+function closedTimestampOf(t) {
+  if (typeof t.closeTimestamp === 'number') return t.closeTimestamp;
+  return parseArgTimeToMs(t.closeTime);
+}
+
+// Estadísticas de las operaciones cerradas en las últimas `hours` horas — reemplaza
+// el "P&L hoy / Operaciones hoy" del resumen, que leía contadores que se reinician
+// a las 00:00 UTC (21:00 Argentina), una hora ANTES de que salga el resumen (22:00),
+// y por eso siempre mostraba cero.
+function computeWindowStats(trades, nowMs, hours) {
+  const since = nowMs - hours * 3600000;
+  const inWindow = (trades || []).filter(t => { const ts = closedTimestampOf(t); return ts !== null && ts >= since && ts <= nowMs; });
+  const wins = inWindow.filter(t => t.pnl > 0).length;
+  const losses = inWindow.filter(t => t.pnl < 0).length;
+  const pnl = inWindow.reduce((s, t) => s + t.pnl, 0);
+  return { count: inWindow.length, wins, losses, pnl: Math.round(pnl * 100) / 100 };
+}
+
+// Estadísticas SOLO de Estructura — el "Win Rate" histórico del resumen y del panel
+// mezcla las últimas 500 operaciones (la lista se recorta a 500), la mayoría de
+// estrategias viejas ya descartadas, y no sirve para juzgar a la estrategia actual.
+function computeEstructuraStats(trades) {
+  const list = (trades || []).filter(t => t.strategy === 'Estructura');
+  const wins = list.filter(t => t.pnl > 0).length;
+  const losses = list.filter(t => t.pnl < 0).length;
+  const net = list.reduce((s, t) => s + t.pnl, 0);
+  return { total: list.length, wins, losses, winRate: list.length ? Math.round(wins / list.length * 1000) / 10 : 0, net: Math.round(net * 100) / 100 };
+}
+
+// Registro de señales descartadas: junta repeticiones. El loop corre cada 60s y una
+// misma señal bloqueada puede repetirse muchos ciclos seguidos — sin esto se
+// guardaría una entrada por minuto. Misma clave (par|dirección|motivo) dentro de
+// `windowMs` = mismo evento (se suma al contador); si no, evento nuevo.
+const DISCARD_DEDUP_MS = 3 * 3600000;
+const DISCARD_MAX_KEPT = 300;
+function mergeDiscardedSignal(list, draft, nowMs) {
+  const arr = Array.isArray(list) ? list : [];
+  const key = `${draft.pair}|${draft.direction}|${draft.reason}`;
+  const idx = arr.findIndex(e => `${e.pair}|${e.direction}|${e.reason}` === key && (nowMs - e.lastTs) <= DISCARD_DEDUP_MS);
+  if (idx >= 0) {
+    const updated = arr.slice();
+    updated[idx] = { ...arr[idx], count: arr[idx].count + 1, lastTs: nowMs, lastTime: formatArgTime(new Date(nowMs)) };
+    return { list: updated, created: false };
+  }
+  const entry = { id: `${nowMs}-${draft.pair}-${draft.reason}`, ts: nowMs, time: formatArgTime(new Date(nowMs)), lastTs: nowMs, lastTime: formatArgTime(new Date(nowMs)), count: 1, ...draft };
+  return { list: [entry, ...arr].slice(0, DISCARD_MAX_KEPT), created: true };
+}
+
+// ¿Qué habría pasado con una señal descartada? Recorre velas de 5m posteriores a la
+// señal con las mismas reglas que el backtest: TP/SL fijos, cierre forzado a las 48hs.
+// Si TP y SL caen en la misma vela no se puede saber cuál fue primero: se cuenta como
+// SL (criterio pesimista, para no inflar el resultado). R = ganancia/pérdida medida
+// en múltiplos de la distancia al SL (TP = +R/R diseñado, SL = -1).
+function resolveHypotheticalFromCandles(sig, candles, maxHours = 48) {
+  const long = sig.direction === 'COMPRAR';
+  const slDist = Math.abs(sig.entry - sig.sl);
+  if (!(slDist > 0)) return { outcome: 'INVALIDA', r: null };
+  const endTs = sig.ts + maxHours * 3600000;
+  let last = null;
+  for (const c of candles) {
+    if (c.t < sig.ts) continue;
+    if (c.t > endTs) break;
+    last = c;
+    const hitTP = long ? c.h >= sig.tp : c.l <= sig.tp;
+    const hitSL = long ? c.l <= sig.sl : c.h >= sig.sl;
+    if (hitTP && hitSL) return { outcome: 'SL_AMBIGUO', r: -1, exitPrice: sig.sl, hours: Math.round((c.t - sig.ts) / 360000) / 10 };
+    if (hitSL) return { outcome: 'SL', r: -1, exitPrice: sig.sl, hours: Math.round((c.t - sig.ts) / 360000) / 10 };
+    if (hitTP) return { outcome: 'TP', r: Math.round(Math.abs(sig.tp - sig.entry) / slDist * 100) / 100, exitPrice: sig.tp, hours: Math.round((c.t - sig.ts) / 360000) / 10 };
+  }
+  if (!last) return { outcome: 'PENDIENTE', r: null };
+  if (last.t + 5 * 60000 < endTs) return { outcome: 'PENDIENTE', r: null }; // todavía no pasaron las 48hs
+  const move = long ? last.c - sig.entry : sig.entry - last.c;
+  return { outcome: 'TIEMPO', r: Math.round(move / slDist * 100) / 100, exitPrice: last.c, hours: maxHours };
+}
+
+async function fetchKlinesFrom(pair, interval, startTime, limit = 600) {
+  const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${interval}&startTime=${startTime}&limit=${limit}`);
+  if (!res.ok) throw new Error('Binance klines ' + res.status);
+  const data = await res.json();
+  return data.map(k => ({ t: k[0], o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+}
+
+// Guarda el descarte en el estado. Nunca corta el flujo: si algo falla, solo lo loguea.
+// El guardado en base se hace únicamente al crear un evento nuevo (los contadores de
+// repetición se persisten con el próximo guardado normal — es información de medición).
+async function logDiscardedSignal(draft) {
+  try {
+    const { list, created } = mergeDiscardedSignal(state.discardedSignals, draft, Date.now());
+    state.discardedSignals = list;
+    if (created) await saveState(state);
+  } catch (e) { console.log('logDiscardedSignal error:', e.message); }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -108,6 +215,7 @@ const DEFAULT_STATE = {
   ghostTrades: [], // posiciones "fantasma": mismas condiciones que un trade cortado por Sub-SL,
                     // pero sin plata real — para medir si el Sub-SL realmente ayuda o perjudica
   ghostResults: [], // historial de resultados fantasma ya resueltos
+  discardedSignals: [], // (27/9) señales válidas que el bot vio y NO operó, con el motivo — solo medición
   tradingMode: 'demo', // 'demo' | 'testnet' | 'real' — demo es 100% simulado, testnet/real ejecutan órdenes de verdad
   realModeConfirmed: false, // requiere una confirmación explícita antes de poder activar testnet/real por primera vez
   killSwitchActive: false, // interruptor de emergencia: fuerza todo a demo y detiene el AUTO
@@ -129,7 +237,7 @@ const CONFIG_FIELDS = ['autoMode', 'autoPairs', 'autoTFs', 'minConfidence', 'req
 // Campos FINANCIEROS: estos sí quedan completamente separados por modo — el
 // capital, historial y operaciones de demo nunca se mezclan con los de testnet/real.
 const FINANCIAL_FIELDS = ['capital', 'trades', 'openTrades', 'dailyPnl', 'dailyTrades',
-  'consecutiveLosses', 'pairCooldowns', 'subSlStreak', 'ghostTrades', 'ghostResults', 'lastResetDate'];
+  'consecutiveLosses', 'pairCooldowns', 'subSlStreak', 'ghostTrades', 'ghostResults', 'discardedSignals', 'lastResetDate'];
 
 function freshFinancialState() {
   const fresh = {};
@@ -1314,6 +1422,8 @@ async function openTrade(pair, tf, analysis) {
     if (!r.ok) {
       console.log(`Módulo de riesgo: se saltea ${pair} — ${r.reason}`);
       sendTelegram(`⚠️ Señal descartada por el módulo de riesgo en ${pair.replace('USDT','/USDT')}: ${r.reason}`);
+      // (Fase de medición 2) solo registro
+      await logDiscardedSignal({ pair, direction: analysis.signal, strategy: analysis.strategy || 'n/d', reason: 'riesgo', detail: String(r.reason), entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, adx4h: analysis.adx4h !== undefined ? analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
       return;
     }
     size = r.size; riskUsd = r.riskUsd;
@@ -2129,6 +2239,8 @@ async function runAutoCheckInner() {
           if (corr !== null && corr > 0.7) {
             blockedByCorrelation = true;
             console.log(`${pair} bloqueado por correlación con ${sameDirectionOther.pair} (${corr.toFixed(2)}) — misma dirección, no diversifica`);
+            // (Fase de medición 2) solo registro — no cambia cuál señal se opera
+            await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'correlacion', detail: `con ${sameDirectionOther.pair} (corr ${corr.toFixed(2)})`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
           }
         } catch (e) { console.log('Correlation check error:', e.message); }
       }
@@ -2136,6 +2248,8 @@ async function runAutoCheckInner() {
         allSignals.push(chosen);
       } else if (stillCoolingDown) {
         console.log(`${cooldownKey} en enfriamiento, se salta esta señal (${Math.round((cooldownUntil - Date.now()) / 60000)} min restantes)`);
+        // (Fase de medición 2) solo registro — no cambia cuál señal se opera
+        await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'enfriamiento', detail: `${Math.round((cooldownUntil - Date.now()) / 60000)} min restantes`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
       }
     }
   }
@@ -2264,6 +2378,63 @@ app.get("/stats/all-modes", async (req, res) => {
 // etc.) solo existen en operaciones cerradas DESPUÉS de este cambio — las
 // viejas van a aparecer con esos campos en null/"sin dato", lo cual es
 // correcto: no se puede reconstruir ese contexto retroactivamente.
+// (Fase de medición 2, 27/9/2026) Señales válidas que el bot vio y NO operó (correlación,
+// enfriamiento, módulo de riesgo), agrupadas por motivo y par, y qué habría pasado con
+// cada una si se hubiera operado (TP/SL fijos, cierre a 48hs, medido en R). Solo lee.
+// El resultado hipotético se calcula al consultar (velas de 5m de Binance) y se guarda en
+// memoria cuando ya está definido, así no se repite el pedido en cada consulta.
+const hypoCache = new Map();
+app.get("/stats/senales-descartadas", async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 40, 1), 100);
+    const all = state.discardedSignals || [];
+    if (all.length === 0) return res.json({ success: true, totalEventos: 0, note: 'Todavía no se registró ninguna señal descartada (el registro empieza desde el deploy de esta versión).' });
+    const porMotivo = {}, porPar = {};
+    let repeticiones = 0;
+    for (const e of all) {
+      porMotivo[e.reason] = (porMotivo[e.reason] || 0) + 1;
+      porPar[e.pair] = (porPar[e.pair] || 0) + 1;
+      repeticiones += e.count || 1;
+    }
+    const resolved = [];
+    for (const e of all.slice(0, limit)) {
+      let hyp = hypoCache.get(e.id);
+      if (!hyp) {
+        try {
+          const candles = await fetchKlinesFrom(e.pair, '5m', e.ts, 600);
+          hyp = resolveHypotheticalFromCandles(e, candles);
+          if (hyp.outcome !== 'PENDIENTE') hypoCache.set(e.id, hyp);
+        } catch (err) { hyp = { outcome: 'ERROR', r: null, error: err.message }; }
+      }
+      resolved.push({ ...e, hipotetico: hyp });
+    }
+    const resumen = {};
+    for (const e of resolved) {
+      if (!resumen[e.reason]) resumen[e.reason] = { eventos: 0, TP: 0, SL: 0, TIEMPO: 0, PENDIENTE: 0, sinDato: 0, ambiguasContadasComoSL: 0, sumaR: 0 };
+      const b = resumen[e.reason]; b.eventos++;
+      const o = e.hipotetico.outcome;
+      if (o === 'TP') b.TP++;
+      else if (o === 'SL') b.SL++;
+      else if (o === 'SL_AMBIGUO') { b.SL++; b.ambiguasContadasComoSL++; }
+      else if (o === 'TIEMPO') b.TIEMPO++;
+      else if (o === 'PENDIENTE') b.PENDIENTE++;
+      else b.sinDato++;
+      if (typeof e.hipotetico.r === 'number') b.sumaR += e.hipotetico.r;
+    }
+    for (const k in resumen) resumen[k].sumaR = Math.round(resumen[k].sumaR * 100) / 100;
+    res.json({
+      success: true,
+      totalEventos: all.length, totalRepeticiones: repeticiones,
+      porMotivo, porPar,
+      resumenHipotetico: { evaluados: resolved.length, porMotivo: resumen },
+      nota: 'R = múltiplos de la distancia al SL (TP ≈ +2R, SL = -1R). Si TP y SL caen en la misma vela de 5m se cuenta SL (criterio pesimista). Sin comisiones. Un motivo con sumaR negativa = el filtro evitó pérdidas; positiva = dejó pasar ganancias.',
+      ultimos: resolved.slice(0, 15).map(e => ({ hora: e.time, par: e.pair, direccion: e.direction, motivo: e.reason, detalle: e.detail, repeticiones: e.count, entrada: e.entry, tp: e.tp, sl: e.sl, adx4h: e.adx4h, abiertasAlDescartar: e.openPairs, hipotetico: e.hipotetico }))
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/stats/estructura-detail", (req, res) => {
   try {
     const trades = (state.trades || []).filter(t => t.strategy === 'Estructura');
@@ -2658,13 +2829,31 @@ function scheduleDailySummary() {
 }
 
 async function sendDailySummaryMsg() {
-  const { wins, losses, winRate } = summarizeTradesByOutcome(state.trades);
+  // (Fase de medición 2, 27/9/2026) Antes el P&L y la cantidad de operaciones "de hoy" salían
+  // de contadores que se reinician a las 00:00 UTC (21:00 Argentina) — una hora antes de este
+  // resumen (22:00) — y por eso siempre daban cero. Ahora se calculan directo del historial:
+  // todo lo que cerró en las últimas 24hs (de 22:00 a 22:00, la misma ventana del resumen).
+  // Los contadores dailyPnl/dailyTrades NO se tocan: siguen siendo los de los límites diarios.
+  const nowMs = Date.now();
+  const day = computeWindowStats(state.trades, nowMs, 24);
+  const est = computeEstructuraStats(state.trades);
+  const mixed = summarizeTradesByOutcome(state.trades); // últimas 500, incluye estrategias viejas descartadas
+  const wins = mixed.wins, losses = mixed.losses, winRate = mixed.winRate;
   let motivacion = '';
-  if (state.dailyPnl > 0 && winRate >= 60) motivacion = '🚀 Excelente día! Seguí así, campeón!';
-  else if (state.dailyPnl > 0) motivacion = '🟢 Buen día! De a poco se llega lejos.';
-  else if (state.dailyPnl < 0 && losses >= 3) motivacion = '💪 Dale vos podés! Mañana es otro día.';
-  else if (state.dailyPnl < 0) motivacion = '🔴 Día difícil. Revisá las señales y descansá.';
+  if (day.pnl > 0 && est.winRate >= 60) motivacion = '🚀 Excelente día! Seguí así, campeón!';
+  else if (day.pnl > 0) motivacion = '🟢 Buen día! De a poco se llega lejos.';
+  else if (day.pnl < 0 && day.losses >= 3) motivacion = '💪 Dale vos podés! Mañana es otro día.';
+  else if (day.pnl < 0) motivacion = '🔴 Día difícil. Revisá las señales y descansá.';
   else motivacion = '⚪ Día tranquilo. El mercado espera su momento.';
+  const openNow = (state.openTrades || []).length
+    ? state.openTrades.map(t => `${t.pair.replace('USDT', '')} ${t.direction || t.signal} @ $${formatPrice(t.entry)}`).join(' · ')
+    : 'ninguna';
+  const discarded24 = (state.discardedSignals || []).filter(e => (e.lastTs || e.ts) >= nowMs - 24 * 3600000);
+  const discByReason = {};
+  for (const e of discarded24) discByReason[e.reason] = (discByReason[e.reason] || 0) + 1;
+  const discTxt = discarded24.length
+    ? `${discarded24.length} (${Object.entries(discByReason).map(([k, v]) => `${k} ${v}`).join(', ')})`
+    : 'ninguna';
   const now = formatArgTime(new Date());
   // Fase 3a: estado del sistema + ADX 4h de cada par, para saber cada mañana POR QUÉ operó o no operó
   let adxLines = '';
@@ -2678,7 +2867,7 @@ async function sendDailySummaryMsg() {
   }
   const bloqueado = autoTradingBlockedByMode() ? '\n⚠️ AUTO-TRADING BLOQUEADO: modo ≠ demo' : '';
   const sistema = `🔧 Modo: ${String(state.tradingMode).toUpperCase()} · autoMode: ${state.autoMode ? 'ON' : 'OFF'} · tamaño: ${SIZING_MODE === 'risk' ? `riesgo ${RISK_PER_TRADE_PCT}%` : `fijo ${state.positionSizePct || 30}%`}${bloqueado}\n📡 Filtro Estructura (umbral ADX 25):${adxLines}`;
-  sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L hoy: ${state.dailyPnl>=0?'+':''}$${state.dailyPnl.toFixed(2)}\n🎯 Operaciones hoy: ${state.dailyTrades}\n✅ Ganadas: ${wins}\n❌ Perdidas: ${losses}\n📊 Win Rate: ${winRate}%\n\n${sistema}\n\n${motivacion}`);
+  sendTelegram(`📊 RESUMEN DIARIO (Servidor 24/7)\n📅 ${now}\n\n💰 Capital: $${state.capital.toFixed(2)}\n📈 P&L últimas 24hs: ${day.pnl>=0?'+':''}$${day.pnl.toFixed(2)}\n🎯 Operaciones cerradas (24hs): ${day.count} (${day.wins} ganadas / ${day.losses} perdidas)\n\n🧠 ESTRUCTURA (acumulado): ${est.total} cerradas · ${est.wins} ganadas / ${est.losses} perdidas · ${est.winRate}% · neto ${est.net>=0?'+':''}$${est.net.toFixed(2)}\n📦 Abiertas ahora: ${openNow}\n🚫 Señales descartadas (24hs): ${discTxt}\n\n📚 Histórico mixto (últimas 500, incluye estrategias viejas descartadas): ${wins}G / ${losses}P · ${winRate}%\n\n${sistema}\n\n${motivacion}`);
   state.dailyPnl = 0; state.dailyTrades = 0;
   await saveState(state);
 }

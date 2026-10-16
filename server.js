@@ -1670,9 +1670,18 @@ async function closeTradeById(tradeId, exitPrice, reason) {
   const emoji = pnl >= 0 ? '✅' : '❌';
   sendTelegram(`${emoji} OPERACIÓN CERRADA (Servidor)\n📊 ${t.pair.replace('USDT','/USDT')} · ${t.tf}\n${t.signal} · ${t.direction}\n💵 $${formatPrice(t.entry)} → $${formatPrice(exitPrice)}\n${pnl>=0?'💰':'📉'} PnL neto: ${pnl>=0?'+':''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\n💸 Comisión simulada: -$${commission.toFixed(2)}\n🏷 ${reason}${durationMinutes !== null ? `\n⏱ Duración: ${durationMinutes < 60 ? durationMinutes + ' min' : (durationMinutes/60).toFixed(1) + ' hs'}` : ''}${mfePct !== null ? `\n📈 Máx. a favor: ${mfePct.toFixed(2)}% · Máx. en contra: ${maePct.toFixed(2)}%` : ''}\n💰 Capital: $${state.capital.toFixed(2)}`);
   if (state.consecutiveLosses >= 3) {
-    sendTelegram(`⚠️ BOT PAUSADO (Servidor)\n3 pérdidas seguidas\n🛡 Capital protegido: $${state.capital.toFixed(2)}`);
-    state.autoMode = false;
-    await saveState(state);
+    if (state.tradingMode === 'demo') {
+      // (16/10) En DEMO la plata es simulada: pausar no protege nada y sesga la muestra (el bot deja
+      // de operar justo después de una racha mala, cuando más datos necesitamos). Solo se avisa y se
+      // reinicia el contador. En testnet/real la pausa sigue igual que siempre.
+      sendTelegram(`⚠️ 3 pérdidas seguidas (DEMO)\nEl bot SIGUE operando: en demo no se pausa.\n💰 Capital: $${state.capital.toFixed(2)}`);
+      state.consecutiveLosses = 0;
+      await saveState(state);
+    } else {
+      sendTelegram(`⚠️ BOT PAUSADO (Servidor)\n3 pérdidas seguidas\n🛡 Capital protegido: $${state.capital.toFixed(2)}`);
+      state.autoMode = false;
+      await saveState(state);
+    }
   }
 }
 

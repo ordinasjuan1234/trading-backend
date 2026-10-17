@@ -1351,9 +1351,26 @@ function analyze(closes, highs, lows) {
   return { signal, direction, confidence: conf, price, entry, tp, sl, rr, bullScore: bull, bearScore: bear, rsi };
 }
 
+// (16/10) MEDICIÓN: cuenta pedidos de velas a Binance que salen bien o fallan, por par.
+// Solo cuenta — no cambia qué se pide ni qué se hace con la respuesta. Vive en memoria
+// (se reinicia con cada deploy). Se consulta en GET /stats/fallas-velas.
+const klinesStatsSince = Date.now();
+const klinesStats = {};
+const estructuraCycleStats = {};
 async function fetchKlines(pair, tf, limit = 100) {
-  const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}`);
-  if (!res.ok) throw new Error('Par no encontrado');
+  const stat = klinesStats[pair] || (klinesStats[pair] = { ok: 0, fail: 0, lastStatus: null, lastFailAt: null });
+  let res;
+  try {
+    res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=${tf}&limit=${limit}`);
+  } catch (e) {
+    stat.fail++; stat.lastStatus = 'red: ' + e.message; stat.lastFailAt = new Date().toISOString();
+    throw e;
+  }
+  if (!res.ok) {
+    stat.fail++; stat.lastStatus = res.status; stat.lastFailAt = new Date().toISOString();
+    throw new Error('Par no encontrado');
+  }
+  stat.ok++;
   const data = await res.json();
   return {
     opens: data.map(k => parseFloat(k[1])),
@@ -2146,12 +2163,14 @@ async function runAutoCheckInner() {
     // primera vez que las 4 dan positivo a la vez, y con más operaciones
     // en los períodos de mercado más flojo (donde antes casi no operaba).
     // minAdx4h=25 (bajado de 30 el 4/9, con backtest que lo respalda).
+    const cyc = estructuraCycleStats[pair] || (estructuraCycleStats[pair] = { analizados: 0, conSenal: 0, errores: 0, ultimoError: null });
     try {
       const { closes: closes30e, highs: highs30e, lows: lows30e } = await fetchKlines(pair, '30m', 100);
       const { closes: closesH4e, highs: highsH4e, lows: lowsH4e } = await fetchKlines(pair, '4h', 60);
       const f = analyzeStructuralEntry(closes30e, highs30e, lows30e, closesH4e, highsH4e, lowsH4e, 25);
-      if (f && f.signal !== 'NEUTRO') signals.push({ tf: '30m', pair, signal: f.signal, confidence: f.confidence, analysis: f });
-    } catch (e) { console.log(`Analyze Estructura error ${pair}:`, e.message); }
+      cyc.analizados++; // (16/10) medición
+      if (f && f.signal !== 'NEUTRO') { cyc.conSenal++; signals.push({ tf: '30m', pair, signal: f.signal, confidence: f.confidence, analysis: f }); }
+    } catch (e) { cyc.errores++; cyc.ultimoError = e.message; console.log(`Analyze Estructura error ${pair}:`, e.message); }
     // Rebote PAUSADA (4/8/2026) — backtest de 90 días / 264 operaciones dio
     // PnL BRUTO negativo (-$28.47, antes de comisión): la señal de entrada no
     // tiene filo real, no es un problema de calibración de salida. Winrate
@@ -2442,6 +2461,22 @@ app.get("/stats/senales-descartadas", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// (16/10) MEDICIÓN — ¿cuántas veces falla el pedido de velas a Binance, por par, y cuántos
+// ciclos de análisis de Estructura se completaron? Solo lectura, no toca el trading.
+app.get("/stats/fallas-velas", (req, res) => {
+  const porPar = {};
+  for (const pair of Object.keys(klinesStats)) {
+    const s = klinesStats[pair], total = s.ok + s.fail;
+    porPar[pair] = { pedidosOk: s.ok, pedidosFallidos: s.fail, pctFallo: total ? ((s.fail / total) * 100).toFixed(2) + '%' : '0%', ultimoEstado: s.lastStatus, ultimaFalla: s.lastFailAt };
+  }
+  const ciclos = {};
+  for (const pair of Object.keys(estructuraCycleStats)) {
+    const c = estructuraCycleStats[pair], total = c.analizados + c.errores;
+    ciclos[pair] = { ...c, pctCiclosConError: total ? ((c.errores / total) * 100).toFixed(2) + '%' : '0%' };
+  }
+  res.json({ success: true, desde: new Date(klinesStatsSince).toISOString(), horasMedidas: ((Date.now() - klinesStatsSince) / 3600000).toFixed(1), pedidosDeVelas: porPar, ciclosEstructura: ciclos, nota: 'Se reinicia con cada deploy. pctCiclosConError alto = el bot en vivo se pierde señales por fallas de Binance.' });
 });
 
 app.get("/stats/estructura-detail", (req, res) => {
@@ -3327,17 +3362,22 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
   const pnlByReason = {};
   let signalsSeenBeforeFilter = 0, signalsSkippedByEdgeFilter = 0, signalsSkippedByRegime = 0, signalsSkippedByAdx = 0, signalsSkippedBySizing = 0;
   const MIN_HISTORY = 60;
+  // (16/10) MEDICIÓN: tamaño de la ventana de velas que ve el análisis. Por defecto 60 y 40
+  // (= comportamiento de siempre, resultados idénticos). El bot en vivo ve 100 velas de 30m y
+  // 60 de 4h: con windowMain=99 y window4h=59 el backtest replica esa ventana en vivo.
+  const WIN_MAIN = config.windowMain ?? MIN_HISTORY;
+  const WIN_4H = config.window4h ?? 40;
   let p4h = 0;
 
-  for (let i = MIN_HISTORY; i < candlesMain.length; i++) {
+  for (let i = Math.max(MIN_HISTORY, WIN_MAIN); i < candlesMain.length; i++) {
     const current = candlesMain[i];
-    const window = candlesMain.slice(Math.max(0, i - MIN_HISTORY), i + 1);
+    const window = candlesMain.slice(Math.max(0, i - WIN_MAIN), i + 1);
     const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
 
     // Avanzar el puntero de 4h hasta la última vela YA CERRADA al momento actual (sin lookahead).
     while (p4h < candles4h.length - 1 && candles4h[p4h + 1].time <= current.time) p4h++;
     if (candles4h[p4h].time > current.time || p4h < 19) continue; // todavía no hay suficiente historial 4h real
-    const window4h = candles4h.slice(Math.max(0, p4h - 40), p4h + 1);
+    const window4h = candles4h.slice(Math.max(0, p4h - WIN_4H), p4h + 1);
     const closes4h = window4h.map(c => c.close), highs4h = window4h.map(c => c.high), lows4h = window4h.map(c => c.low);
 
     const a = analyzeStructuralEntry(closes, highs, lows, closes4h, highs4h, lows4h, minAdx4h);
@@ -3870,7 +3910,7 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours, windowMain: req.body.windowMain, window4h: req.body.window4h });
       return res.json({
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },

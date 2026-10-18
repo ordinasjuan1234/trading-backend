@@ -3367,6 +3367,7 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
   // 60 de 4h: con windowMain=99 y window4h=59 el backtest replica esa ventana en vivo.
   const WIN_MAIN = config.windowMain ?? MIN_HISTORY;
   const WIN_4H = config.window4h ?? 40;
+  const MODE_4H = config.mode4h || 'actual';
   let p4h = 0;
 
   for (let i = Math.max(MIN_HISTORY, WIN_MAIN); i < candlesMain.length; i++) {
@@ -3377,7 +3378,24 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     // Avanzar el puntero de 4h hasta la última vela YA CERRADA al momento actual (sin lookahead).
     while (p4h < candles4h.length - 1 && candles4h[p4h + 1].time <= current.time) p4h++;
     if (candles4h[p4h].time > current.time || p4h < 19) continue; // todavía no hay suficiente historial 4h real
-    const window4h = candles4h.slice(Math.max(0, p4h - WIN_4H), p4h + 1);
+    // (18/10) MEDICIÓN — posible sesgo de "mirar el futuro" en el backtest: candles4h[p4h] es la vela de 4h
+    // que CONTIENE a la vela actual de 30m, pero se toma ya COMPLETA (su máximo, mínimo y cierre incluyen
+    // hasta 3,5 horas que todavía no pasaron). El bot en vivo no puede ver eso. Tres modos (config.mode4h):
+    //   'actual' (por defecto) = comportamiento de siempre, sin cambios;
+    //   'cerrada' = solo la última vela de 4h ya cerrada (conservador);
+    //   'vivo'    = velas cerradas + la vela de 4h en formación armada solo con lo ocurrido hasta ahora (como el bot en vivo).
+    let window4h;
+    if (MODE_4H === 'cerrada') {
+      window4h = candles4h.slice(Math.max(0, p4h - 1 - WIN_4H), p4h);
+    } else if (MODE_4H === 'vivo') {
+      let k = i;
+      while (k > 0 && candlesMain[k - 1].time >= candles4h[p4h].time) k--;
+      const part = candlesMain.slice(k, i + 1);
+      const partial = { time: candles4h[p4h].time, open: part[0].open, high: Math.max(...part.map(c => c.high)), low: Math.min(...part.map(c => c.low)), close: part[part.length - 1].close, volume: 0 };
+      window4h = candles4h.slice(Math.max(0, p4h - WIN_4H), p4h).concat([partial]);
+    } else {
+      window4h = candles4h.slice(Math.max(0, p4h - WIN_4H), p4h + 1);
+    }
     const closes4h = window4h.map(c => c.close), highs4h = window4h.map(c => c.high), lows4h = window4h.map(c => c.low);
 
     const a = analyzeStructuralEntry(closes, highs, lows, closes4h, highs4h, lows4h, minAdx4h);
@@ -3910,7 +3928,7 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours, windowMain: req.body.windowMain, window4h: req.body.window4h });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours, windowMain: req.body.windowMain, window4h: req.body.window4h, mode4h: req.body.mode4h });
       return res.json({
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },

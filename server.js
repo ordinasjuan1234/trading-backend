@@ -3437,9 +3437,11 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     const dir = signal === 'COMPRAR' ? 1 : -1;
     const entryFill = entry * (1 + dir * slip);
     let extended = false;
+    let lastJ = i; // (18/10) índice de la última vela que recorrió esta operación
     for (let j = i + 1; j < candlesMain.length && barsOpen < (extended ? EXT_BARS : MAX_BARS); j++) {
       const c = candlesMain[j];
       barsOpen++;
+      lastJ = j;
       if (signal === 'COMPRAR') {
         if (c.low <= sl) { exitPrice = sl * (1 - slip); reason = 'SL estructural'; break; }
         if (c.high >= tp) { exitPrice = tp; reason = 'TP estructural'; break; }
@@ -3462,7 +3464,11 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     const commission = size * COMMISSION_PCT * 2;
     const pnl = grossPnl - commission;
     capital += pnl;
-    trades.push({ signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h, size: Math.round(size * 100) / 100, riskUsd, rMultiple: riskUsd ? Math.round(pnl / riskUsd * 100) / 100 : null });
+    // (18/10) MEDICIÓN: por defecto el backtest abre una operación nueva en CADA vela con señal, aunque la anterior
+    // del mismo par siga abierta (se resuelven todas de forma independiente). El bot en vivo opera UNA por par a la vez.
+    // Con config.noOverlap=true no se abre otra hasta que la anterior cierre. Por defecto: comportamiento de siempre.
+    if (config.noOverlap) i = lastJ;
+    trades.push({ entryTime: current.time, exitTime: candlesMain[lastJ].time, signal, entry, exitPrice, pnl, grossPnl, commission, reason, rr: a.rr, regime4h: a.regime4h, size: Math.round(size * 100) / 100, riskUsd, rMultiple: riskUsd ? Math.round(pnl / riskUsd * 100) / 100 : null });
     closedByReason[reason] = (closedByReason[reason] || 0) + 1;
     pnlByReason[reason] = Math.round(((pnlByReason[reason] || 0) + pnl) * 100) / 100; // P&L separado por tipo de cierre (SL / TP / tiempo)
     if (capital > peakCapital) peakCapital = capital;
@@ -3479,6 +3485,8 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     sizing: { mode: config.sizingMode === 'risk' ? 'risk' : 'fixed', riskPerTradePct: config.sizingMode === 'risk' ? (config.riskPerTradePct ?? 0.5) : null, fixedPct: config.sizingMode === 'risk' ? null : riskPct, expectancyR, signalsSkippedBySizing, slippagePct: config.slippagePct || 0, maxHours: config.maxHours || 48, loserExtendHours: config.loserExtendHours || null },
     pnlByReason,
     trades: trades.length, wins, losses,
+    noOverlap: !!config.noOverlap,
+    tradeList: config.includeTrades ? trades.map(t => ({ lado: t.signal, entrada: t.entry, salida: t.exitPrice, pnl: Math.round(t.pnl * 100) / 100, motivo: t.reason, abre: new Date(t.entryTime).toISOString(), cierra: new Date(t.exitTime).toISOString() })) : undefined,
     winRate: trades.length > 0 ? (wins / trades.length * 100).toFixed(1) : "0",
     finalCapital: capital.toFixed(2),
     totalPnl: totalPnl.toFixed(2),
@@ -3928,7 +3936,7 @@ app.post("/backtest", async (req, res) => {
       });
     }
     if (strategy === 'estructura-realistic') {
-      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours, windowMain: req.body.windowMain, window4h: req.body.window4h, mode4h: req.body.mode4h });
+      const result = await runStructuralEntryBacktest(pair, tf, days, { minConfidence, riskPct, initialCapital, endDate, minAdx4h, sizingMode, riskPerTradePct, slippagePct, maxHours, loserExtendHours, windowMain: req.body.windowMain, window4h: req.body.window4h, mode4h: req.body.mode4h, noOverlap: req.body.noOverlap, includeTrades: req.body.includeTrades });
       return res.json({
         success: true,
         config: { pair, tf, days, minConfidence, riskPct, initialCapital, strategy, minAdx4h: minAdx4h ?? 20, endDate: endDate || 'ahora', sizingMode: sizingMode || 'fixed', riskPerTradePct: sizingMode === 'risk' ? (riskPerTradePct ?? 0.5) : null },

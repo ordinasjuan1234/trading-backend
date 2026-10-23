@@ -13,6 +13,13 @@ const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por 
 // Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
 const SIZING_MODE = 'risk';
 const RISK_PER_TRADE_PCT = 0.75;
+// ── (23/10/2026) Filtros de cartera, medidos en el backtest de cartera del 23/10 (9 pares juntos, 7 meses) ──
+// El filtro de correlación viejo comparaba solo contra la PRIMERA posición abierta del mismo lado y no veía las señales
+// aceptadas en el mismo ciclo: el 18/10 dejó entrar 5 cortos juntos (hasta 7 posiciones del mismo lado en el backtest).
+// Ahora compara contra TODAS (abiertas + aceptadas en este ciclo) y hay un tope de exposición total (spot, sin apalancamiento).
+// Para volver al comportamiento anterior: MAX_TOTAL_EXPOSURE_PCT = Infinity y revertir este commit.
+const CORRELATION_THRESHOLD = 0.7;
+const MAX_TOTAL_EXPOSURE_PCT = 100;
 // ── Fase 2b: límite de tiempo de Estructura alineado a lo validado ──
 // 'validated' = Estructura cierra a las 48 h SIEMPRE, vaya ganando o perdiendo (lo que se backtesteó).
 // 'legacy'    = comportamiento anterior: a las 48 h solo cierra si no va en pérdida neta; si pierde,
@@ -1316,6 +1323,25 @@ function calcCorrelation(closesA, closesB) {
   return den === 0 ? 0 : num / den;
 }
 
+// (23/10/2026) ¿La señal nueva duplica la apuesta de alguna posición ya abierta o ya aceptada en este ciclo?
+// `others` = [{ pair, signal }]. `getCloses1h(pair)` devuelve los cierres 1h (con caché por ciclo, para no pedir de más a Binance).
+// Devuelve { pair, corr } de la primera posición del mismo lado con correlación > umbral, o null.
+async function findCorrelatedPosition(pair, direction, others, getCloses1h) {
+  for (const o of others) {
+    if (o.pair === pair || o.signal !== direction) continue;
+    const corr = calcCorrelation(await getCloses1h(pair), await getCloses1h(o.pair));
+    if (corr !== null && corr > CORRELATION_THRESHOLD) return { pair: o.pair, corr };
+  }
+  return null;
+}
+
+// (23/10/2026) ¿Abrir esta posición pasaría el tope de exposición total? Suma el tamaño de lo abierto + lo nuevo.
+function wouldExceedExposure(openTrades, newSize, capitalBase, maxPct = MAX_TOTAL_EXPOSURE_PCT) {
+  if (!(capitalBase > 0)) return false;
+  const openUsd = openTrades.reduce((sum, t) => sum + (t.size || 0), 0);
+  return openUsd + newSize > capitalBase * maxPct / 100 + 1e-9;
+}
+
 function analyze(closes, highs, lows) {
   if (!closes || closes.length < 30) return null;
   const price = closes[closes.length - 1];
@@ -1447,6 +1473,13 @@ async function openTrade(pair, tf, analysis) {
     console.log(`Módulo de riesgo: ${pair} compra $${r.size} (${r.exposurePct}% del capital), arriesga $${r.riskUsd}, SL a ${r.slDistPct}%${r.capped ? ' [topado por techo de exposición]' : ''}`);
   } else {
     size = capitalBase * (pct / 100);
+  }
+  // (23/10/2026) Tope de exposición total: spot no permite más del 100% del capital abierto entre todas las posiciones.
+  if (wouldExceedExposure(state.openTrades, size, capitalBase)) {
+    const openUsd = state.openTrades.reduce((sum, t) => sum + (t.size || 0), 0);
+    console.log(`Tope de exposición: se saltea ${pair} — abierto $${openUsd.toFixed(2)} + nuevo $${size.toFixed(2)} supera ${MAX_TOTAL_EXPOSURE_PCT}% del capital ($${capitalBase.toFixed(2)})`);
+    await logDiscardedSignal({ pair, direction: analysis.signal, strategy: analysis.strategy || 'n/d', reason: 'exposicion', detail: `abierto $${openUsd.toFixed(0)} + nuevo $${size.toFixed(0)} > ${MAX_TOTAL_EXPOSURE_PCT}% del capital`, entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, adx4h: analysis.adx4h !== undefined ? analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
+    return;
   }
   let qty = analysis.entry > 0 ? size / analysis.entry : 0;
   let realEntry = analysis.entry;
@@ -2143,6 +2176,8 @@ async function runAutoCheckInner() {
   if (freePairs.length === 0) return;
 
   let allSignals = [];
+  const closes1hCache = {}; // por ciclo: cada par pide su 1h una sola vez aunque se compare varias veces
+  const getCloses1h = async (p) => closes1hCache[p] || (closes1hCache[p] = (await fetchKlines(p, '1h', 50)).closes);
   for (const pair of freePairs) {
     let signals = [];
     // (12/9/2026) Se sacó el fetch de velas 30m/15m/1h que alimentaba a
@@ -2258,17 +2293,19 @@ async function runAutoCheckInner() {
       // correlacionados (>0.7), abrir esta segunda es duplicar la misma
       // apuesta con otro nombre — no diversifica de verdad el riesgo.
       let blockedByCorrelation = false;
-      const sameDirectionOther = state.openTrades.find(t => t.pair !== pair && t.signal === chosen.direction);
-      if (sameDirectionOther && !stillCoolingDown) {
+      if (!stillCoolingDown) {
         try {
-          const dataA = await fetchKlines(pair, '1h', 50);
-          const dataB = await fetchKlines(sameDirectionOther.pair, '1h', 50);
-          const corr = calcCorrelation(dataA.closes, dataB.closes);
-          if (corr !== null && corr > 0.7) {
+          // (23/10/2026) contra TODAS las posiciones del mismo lado: las abiertas y las ya aceptadas antes en este mismo ciclo
+          const comparar = [
+            ...state.openTrades.map(t => ({ pair: t.pair, signal: t.signal })),
+            ...allSignals.map(s => ({ pair: s.pair, signal: s.direction }))
+          ];
+          const hit = await findCorrelatedPosition(pair, chosen.direction, comparar, getCloses1h);
+          if (hit) {
             blockedByCorrelation = true;
-            console.log(`${pair} bloqueado por correlación con ${sameDirectionOther.pair} (${corr.toFixed(2)}) — misma dirección, no diversifica`);
+            console.log(`${pair} bloqueado por correlación con ${hit.pair} (${hit.corr.toFixed(2)}) — misma dirección, no diversifica`);
             // (Fase de medición 2) solo registro — no cambia cuál señal se opera
-            await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'correlacion', detail: `con ${sameDirectionOther.pair} (corr ${corr.toFixed(2)})`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
+            await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'correlacion', detail: `con ${hit.pair} (corr ${hit.corr.toFixed(2)})`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
           }
         } catch (e) { console.log('Correlation check error:', e.message); }
       }

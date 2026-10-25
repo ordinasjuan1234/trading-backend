@@ -13,13 +13,6 @@ const { calcPositionSize } = require("./risk"); // Fase 1 refactor: tamaño por 
 // Validado en backtest 5/9/2026: 0,75% tiene menor drawdown que el 30% fijo en las 4 ventanas de validación.
 const SIZING_MODE = 'risk';
 const RISK_PER_TRADE_PCT = 0.75;
-// ── (23/10/2026) Filtros de cartera, medidos en el backtest de cartera del 23/10 (9 pares juntos, 7 meses) ──
-// El filtro de correlación viejo comparaba solo contra la PRIMERA posición abierta del mismo lado y no veía las señales
-// aceptadas en el mismo ciclo: el 18/10 dejó entrar 5 cortos juntos (hasta 7 posiciones del mismo lado en el backtest).
-// Ahora compara contra TODAS (abiertas + aceptadas en este ciclo) y hay un tope de exposición total (spot, sin apalancamiento).
-// Para volver al comportamiento anterior: MAX_TOTAL_EXPOSURE_PCT = Infinity y revertir este commit.
-const CORRELATION_THRESHOLD = 0.7;
-const MAX_TOTAL_EXPOSURE_PCT = 100;
 // ── Fase 2b: límite de tiempo de Estructura alineado a lo validado ──
 // 'validated' = Estructura cierra a las 48 h SIEMPRE, vaya ganando o perdiendo (lo que se backtesteó).
 // 'legacy'    = comportamiento anterior: a las 48 h solo cierra si no va en pérdida neta; si pierde,
@@ -1323,25 +1316,6 @@ function calcCorrelation(closesA, closesB) {
   return den === 0 ? 0 : num / den;
 }
 
-// (23/10/2026) ¿La señal nueva duplica la apuesta de alguna posición ya abierta o ya aceptada en este ciclo?
-// `others` = [{ pair, signal }]. `getCloses1h(pair)` devuelve los cierres 1h (con caché por ciclo, para no pedir de más a Binance).
-// Devuelve { pair, corr } de la primera posición del mismo lado con correlación > umbral, o null.
-async function findCorrelatedPosition(pair, direction, others, getCloses1h) {
-  for (const o of others) {
-    if (o.pair === pair || o.signal !== direction) continue;
-    const corr = calcCorrelation(await getCloses1h(pair), await getCloses1h(o.pair));
-    if (corr !== null && corr > CORRELATION_THRESHOLD) return { pair: o.pair, corr };
-  }
-  return null;
-}
-
-// (23/10/2026) ¿Abrir esta posición pasaría el tope de exposición total? Suma el tamaño de lo abierto + lo nuevo.
-function wouldExceedExposure(openTrades, newSize, capitalBase, maxPct = MAX_TOTAL_EXPOSURE_PCT) {
-  if (!(capitalBase > 0)) return false;
-  const openUsd = openTrades.reduce((sum, t) => sum + (t.size || 0), 0);
-  return openUsd + newSize > capitalBase * maxPct / 100 + 1e-9;
-}
-
 function analyze(closes, highs, lows) {
   if (!closes || closes.length < 30) return null;
   const price = closes[closes.length - 1];
@@ -1473,13 +1447,6 @@ async function openTrade(pair, tf, analysis) {
     console.log(`Módulo de riesgo: ${pair} compra $${r.size} (${r.exposurePct}% del capital), arriesga $${r.riskUsd}, SL a ${r.slDistPct}%${r.capped ? ' [topado por techo de exposición]' : ''}`);
   } else {
     size = capitalBase * (pct / 100);
-  }
-  // (23/10/2026) Tope de exposición total: spot no permite más del 100% del capital abierto entre todas las posiciones.
-  if (wouldExceedExposure(state.openTrades, size, capitalBase)) {
-    const openUsd = state.openTrades.reduce((sum, t) => sum + (t.size || 0), 0);
-    console.log(`Tope de exposición: se saltea ${pair} — abierto $${openUsd.toFixed(2)} + nuevo $${size.toFixed(2)} supera ${MAX_TOTAL_EXPOSURE_PCT}% del capital ($${capitalBase.toFixed(2)})`);
-    await logDiscardedSignal({ pair, direction: analysis.signal, strategy: analysis.strategy || 'n/d', reason: 'exposicion', detail: `abierto $${openUsd.toFixed(0)} + nuevo $${size.toFixed(0)} > ${MAX_TOTAL_EXPOSURE_PCT}% del capital`, entry: analysis.entry, tp: analysis.tp, sl: analysis.sl, adx4h: analysis.adx4h !== undefined ? analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
-    return;
   }
   let qty = analysis.entry > 0 ? size / analysis.entry : 0;
   let realEntry = analysis.entry;
@@ -2176,8 +2143,6 @@ async function runAutoCheckInner() {
   if (freePairs.length === 0) return;
 
   let allSignals = [];
-  const closes1hCache = {}; // por ciclo: cada par pide su 1h una sola vez aunque se compare varias veces
-  const getCloses1h = async (p) => closes1hCache[p] || (closes1hCache[p] = (await fetchKlines(p, '1h', 50)).closes);
   for (const pair of freePairs) {
     let signals = [];
     // (12/9/2026) Se sacó el fetch de velas 30m/15m/1h que alimentaba a
@@ -2293,19 +2258,17 @@ async function runAutoCheckInner() {
       // correlacionados (>0.7), abrir esta segunda es duplicar la misma
       // apuesta con otro nombre — no diversifica de verdad el riesgo.
       let blockedByCorrelation = false;
-      if (!stillCoolingDown) {
+      const sameDirectionOther = state.openTrades.find(t => t.pair !== pair && t.signal === chosen.direction);
+      if (sameDirectionOther && !stillCoolingDown) {
         try {
-          // (23/10/2026) contra TODAS las posiciones del mismo lado: las abiertas y las ya aceptadas antes en este mismo ciclo
-          const comparar = [
-            ...state.openTrades.map(t => ({ pair: t.pair, signal: t.signal })),
-            ...allSignals.map(s => ({ pair: s.pair, signal: s.direction }))
-          ];
-          const hit = await findCorrelatedPosition(pair, chosen.direction, comparar, getCloses1h);
-          if (hit) {
+          const dataA = await fetchKlines(pair, '1h', 50);
+          const dataB = await fetchKlines(sameDirectionOther.pair, '1h', 50);
+          const corr = calcCorrelation(dataA.closes, dataB.closes);
+          if (corr !== null && corr > 0.7) {
             blockedByCorrelation = true;
-            console.log(`${pair} bloqueado por correlación con ${hit.pair} (${hit.corr.toFixed(2)}) — misma dirección, no diversifica`);
+            console.log(`${pair} bloqueado por correlación con ${sameDirectionOther.pair} (${corr.toFixed(2)}) — misma dirección, no diversifica`);
             // (Fase de medición 2) solo registro — no cambia cuál señal se opera
-            await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'correlacion', detail: `con ${hit.pair} (corr ${hit.corr.toFixed(2)})`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
+            await logDiscardedSignal({ pair, direction: chosen.direction, strategy: chosen.analysis.strategy, reason: 'correlacion', detail: `con ${sameDirectionOther.pair} (corr ${corr.toFixed(2)})`, entry: chosen.analysis.entry, tp: chosen.analysis.tp, sl: chosen.analysis.sl, adx4h: chosen.analysis.adx4h !== undefined ? chosen.analysis.adx4h : null, openPairs: state.openTrades.map(x => x.pair) });
           }
         } catch (e) { console.log('Correlation check error:', e.message); }
       }
@@ -3536,6 +3499,274 @@ async function runStructuralEntryBacktest(pair, tf, days, config) {
     candlesUsed: { main: candlesMain.length, h4: candles4h.length }
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (24/10/2026) BACKTEST DE CARTERA — "Paso 5". Solo MEDICIÓN: no toca el bot en vivo
+// ni el backtest de un solo par (runStructuralEntryBacktest sigue igual).
+//
+// Qué hace distinto: corre los 9 pares JUNTOS sobre UNA sola cuenta, con el tiempo avanzando
+// vela a vela, como el bot en vivo:
+//   · una sola operación abierta por par (como en vivo)
+//   · filtro de correlación contra las posiciones abiertas (corrMode: 'first' = como el vivo hoy,
+//     compara solo con la PRIMERA abierta del mismo lado; 'all' = contra TODAS; 'none' = sin filtro)
+//   · tope de riesgo agregado opcional (maxOpenRiskPct) y tope de posiciones del mismo lado (maxSameDirection)
+//   · límites diarios de pérdida/ganancia (se reanudan al día siguiente 00:00 UTC; en vivo hay que reactivar a mano)
+//   · enfriamiento tras pérdida por par+lado
+//   · tamaño por riesgo con calcPositionSize (el mismo módulo que usa el vivo)
+//   · Monte Carlo (idea tomada de trader-timemachine): remuestrea las operaciones 2000 veces para ver
+//     qué tan probable es ganar plata y qué caída máxima se puede esperar, en vez de mirar un solo resultado.
+// Cada filtro informa cuántas señales bloqueó ("PASS/BLOCK con motivo", idea de trader-risk).
+// ─────────────────────────────────────────────────────────────────────────────
+const _portfolioCandleCache = new Map();
+async function getCandlesCached(pair, tf, days, cap, endTimeOverride, endKey) {
+  const key = [pair, tf, days, endKey || 'ahora'].join('|');
+  const hit = _portfolioCandleCache.get(key);
+  if (hit && Date.now() - hit.at < 30 * 60000) return hit.data;
+  const data = await fetchHistoricalCandlesWithVolume(pair, tf, days, cap, endTimeOverride);
+  _portfolioCandleCache.set(key, { at: Date.now(), data });
+  if (_portfolioCandleCache.size > 40) _portfolioCandleCache.delete(_portfolioCandleCache.keys().next().value);
+  return data;
+}
+
+const PORTFOLIO_PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT'];
+
+async function runPortfolioBacktest(config) {
+  const tf = '30m';
+  const days = config.days || 90;
+  const minAdx4h = config.minAdx4h ?? 25;
+  const minConfidence = config.minConfidence ?? 0;
+  const initialCapital = config.initialCapital ?? 1000;
+  const riskPerTradePct = config.riskPerTradePct ?? 0.75;
+  const slip = (config.slippagePct || 0) / 100;
+  const COMMISSION_PCT = 0.001;
+  const corrMode = config.corrMode || 'first';
+  const corrThr = config.corrThreshold ?? 0.7;
+  const dailyLossPct = config.dailyLossLimitPct ?? 3;
+  const dailyGainPct = config.dailyGainLimitPct ?? 5;
+  const cooldownMin = config.cooldownMinutes ?? 30;
+  const maxOpenRiskPct = config.maxOpenRiskPct || null;
+  const maxSameDir = config.maxSameDirection || null;
+  const maxOpensPerDay = config.maxTradesPerDay || null;
+  const minRR = config.minRR || 0;
+  const MODE_4H = config.mode4h || 'vivo';
+  const maxHours = config.maxHours || 48;
+  const loserExtendHours = config.loserExtendHours || null;
+  const mcRuns = config.mcRuns ?? 2000;
+  const excluded = new Set(config.excludePairs || []);
+  const pairs = (config.pairs || PORTFOLIO_PAIRS).filter(p => !excluded.has(p));
+  const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
+  const WIN_MAIN = 60, WIN_4H = 40, MIN_HISTORY = 60;
+  const barsPerHour = 2;
+  const MAX_BARS = Math.max(2, Math.round(maxHours * barsPerHour));
+  const EXT_BARS = loserExtendHours ? Math.round(loserExtendHours * barsPerHour) : MAX_BARS;
+  const mainCap = Math.min(Math.ceil(days * 48) + 200, 20000);
+  const cap4h = Math.min(Math.ceil(days * 6) + 100, 5000);
+
+  // 1) datos (en caché 30 min: así varios escenarios sobre la misma ventana usan EXACTAMENTE las mismas velas)
+  const states = [];
+  for (const pair of pairs) {
+    const [main, h4] = await Promise.all([
+      getCandlesCached(pair, tf, days, mainCap, endTimeOverride, config.endDate),
+      getCandlesCached(pair, '4h', days, cap4h, endTimeOverride, config.endDate)
+    ]);
+    const idx = new Map();
+    main.forEach((c, k) => idx.set(c.time, k));
+    states.push({ pair, main, h4, idx, p4h: 0 });
+  }
+  const timeSet = new Set();
+  states.forEach(s => s.main.forEach(c => timeSet.add(c.time)));
+  const times = Array.from(timeSet).sort((a, b) => a - b);
+
+  // 2) estado de la cartera
+  const open = [];       // posiciones abiertas {pair, signal, entryTime, exitTime, pnl, size, riskUsd, seq}
+  const closed = [];
+  let capital = initialCapital, peak = initialCapital, maxDD = 0;
+  const dayOf = ms => Math.floor(ms / 86400000);
+  let curDay = null, dailyPnl = 0;
+  const opensByDay = {};
+  const cooldownUntil = {};
+  let seq = 0, maxConcurrent = 0, maxSameDirSeen = 0, signalsSeen = 0;
+  const blocked = { edgeMinimo: 0, rrMinimo: 0, limiteDiarioPerdida: 0, limiteDiarioGanancia: 0, enfriamiento: 0, tradesPorDia: 0, correlacion: 0, mismaDireccion: 0, sizing: 0, riesgoAgregado: 0, sinSalida: 0 };
+
+  function settleUpTo(t) {
+    open.sort((a, b) => a.exitTime - b.exitTime);
+    while (open.length && open[0].exitTime < t) {
+      const p = open.shift();
+      const d = dayOf(p.exitTime);
+      if (curDay === null || d > curDay) { curDay = d; dailyPnl = 0; }
+      capital += p.pnl;
+      if (d === curDay) dailyPnl += p.pnl;
+      if (p.pnl < 0) cooldownUntil[p.pair + '-' + p.signal] = p.exitTime + cooldownMin * 60000;
+      closed.push(p);
+      if (capital > peak) peak = capital;
+      const dd = (peak - capital) / peak;
+      if (dd > maxDD) maxDD = dd;
+    }
+  }
+  function closes1h(ps, i, n = 50) {
+    const out = [];
+    for (let k = i; k >= 0 && out.length < n; k--) if (ps.main[k].time % 3600000 === 1800000) out.push(ps.main[k].close);
+    return out.reverse();
+  }
+
+  // 3) línea de tiempo común
+  for (const t of times) {
+    settleUpTo(t);
+    const dT = dayOf(t);
+    if (curDay === null || dT > curDay) { curDay = dT; dailyPnl = 0; }
+
+    for (const ps of states) {
+      const i = ps.idx.get(t);
+      if (i === undefined || i < Math.max(MIN_HISTORY, WIN_MAIN)) continue;
+      if (open.some(p => p.pair === ps.pair)) continue; // una operación por par, como en vivo
+
+      const current = ps.main[i];
+      const window = ps.main.slice(Math.max(0, i - WIN_MAIN), i + 1);
+      const closes = window.map(c => c.close), highs = window.map(c => c.high), lows = window.map(c => c.low);
+      const h4 = ps.h4;
+      while (ps.p4h < h4.length - 1 && h4[ps.p4h + 1].time <= current.time) ps.p4h++;
+      if (h4[ps.p4h].time > current.time || ps.p4h < 19) continue;
+      let window4h;
+      if (MODE_4H === 'cerrada') {
+        window4h = h4.slice(Math.max(0, ps.p4h - 1 - WIN_4H), ps.p4h);
+      } else if (MODE_4H === 'vivo') {
+        let k = i;
+        while (k > 0 && ps.main[k - 1].time >= h4[ps.p4h].time) k--;
+        const part = ps.main.slice(k, i + 1);
+        const partial = { time: h4[ps.p4h].time, open: part[0].open, high: Math.max(...part.map(c => c.high)), low: Math.min(...part.map(c => c.low)), close: part[part.length - 1].close, volume: 0 };
+        window4h = h4.slice(Math.max(0, ps.p4h - WIN_4H), ps.p4h).concat([partial]);
+      } else {
+        window4h = h4.slice(Math.max(0, ps.p4h - WIN_4H), ps.p4h + 1);
+      }
+      const a = analyzeStructuralEntry(closes, highs, lows, window4h.map(c => c.close), window4h.map(c => c.high), window4h.map(c => c.low), minAdx4h);
+      if (!a || a.signal === 'NEUTRO') continue;
+      if (a.confidence < minConfidence) continue;
+      signalsSeen++;
+
+      // ── filtros (cada uno cuenta cuántas señales frena) ──
+      const entry = a.entry, tp = a.tp, sl = a.sl, signal = a.signal;
+      if (config.applyMinEdgeFilter !== false && Math.abs(tp - entry) / entry < 0.006) { blocked.edgeMinimo++; continue; }
+      if (minRR && a.rr < minRR) { blocked.rrMinimo++; continue; }
+      if (dailyLossPct > 0 && dailyPnl <= -(capital * dailyLossPct / 100)) { blocked.limiteDiarioPerdida++; continue; }
+      if (dailyGainPct > 0 && dailyPnl >= capital * dailyGainPct / 100) { blocked.limiteDiarioGanancia++; continue; }
+      const cd = cooldownUntil[ps.pair + '-' + signal];
+      if (cd && t < cd) { blocked.enfriamiento++; continue; }
+      if (maxOpensPerDay && (opensByDay[dT] || 0) >= maxOpensPerDay) { blocked.tradesPorDia++; continue; }
+
+      const sameDir = open.filter(p => p.signal === signal);
+      if (corrMode !== 'none' && sameDir.length) {
+        const mine = closes1h(ps, i);
+        const targets = corrMode === 'all' ? sameDir : [sameDir.slice().sort((x, y) => x.seq - y.seq)[0]];
+        let hit = false;
+        for (const o of targets) {
+          const os = states.find(s => s.pair === o.pair);
+          const oi = os.idx.get(t);
+          if (oi === undefined) continue;
+          const corr = calcCorrelation(mine, closes1h(os, oi));
+          if (corr !== null && corr > corrThr) { hit = true; break; }
+        }
+        if (hit) { blocked.correlacion++; continue; }
+      }
+      if (maxSameDir && sameDir.length >= maxSameDir) { blocked.mismaDireccion++; continue; }
+
+      const r = calcPositionSize({ capital, entry, sl, overrides: { riskPerTradePct } });
+      if (!r.ok) { blocked.sizing++; continue; }
+      const size = r.size, riskUsd = r.riskUsd;
+      if (maxOpenRiskPct) {
+        const openRisk = open.reduce((s, p) => s + (p.riskUsd || 0), 0);
+        if (openRisk + riskUsd > capital * maxOpenRiskPct / 100 + 1e-9) { blocked.riesgoAgregado++; continue; }
+      }
+
+      // ── resolver la operación hacia adelante (misma mecánica que el backtest de un solo par) ──
+      const dir = signal === 'COMPRAR' ? 1 : -1;
+      const entryFill = entry * (1 + dir * slip);
+      let exitPrice = null, reason = null, extended = false, barsOpen = 0, lastJ = i;
+      for (let j = i + 1; j < ps.main.length && barsOpen < (extended ? EXT_BARS : MAX_BARS); j++) {
+        const c = ps.main[j];
+        barsOpen++; lastJ = j;
+        if (signal === 'COMPRAR') {
+          if (c.low <= sl) { exitPrice = sl * (1 - slip); reason = 'SL'; break; }
+          if (c.high >= tp) { exitPrice = tp; reason = 'TP'; break; }
+        } else {
+          if (c.high >= sl) { exitPrice = sl * (1 + slip); reason = 'SL'; break; }
+          if (c.low <= tp) { exitPrice = tp; reason = 'TP'; break; }
+        }
+        if (barsOpen === MAX_BARS - 1 && !extended) {
+          const losing = signal === 'COMPRAR' ? c.close < entry : c.close > entry;
+          if (EXT_BARS > MAX_BARS && losing) { extended = true; continue; }
+          exitPrice = c.close * (1 - dir * slip); reason = 'Tiempo'; // (sin break: la última vela todavía puede resolver por SL/TP, igual que el motor de un par)
+        }
+        if (extended && barsOpen === EXT_BARS - 1) { exitPrice = c.close * (1 - dir * slip); reason = 'Tiempo (extendida)'; }
+      }
+      if (exitPrice === null) { blocked.sinSalida++; continue; } // sin datos suficientes hacia adelante
+      const pricePct = signal === 'COMPRAR' ? (exitPrice - entryFill) / entryFill : (entryFill - exitPrice) / entryFill;
+      const pnl = size * pricePct - size * COMMISSION_PCT * 2;
+      open.push({ pair: ps.pair, signal, entryTime: t, exitTime: ps.main[lastJ].time, pnl, size, riskUsd, reason, seq: ++seq });
+      opensByDay[dT] = (opensByDay[dT] || 0) + 1;
+      if (open.length > maxConcurrent) maxConcurrent = open.length;
+      const sd = open.filter(p => p.signal === signal).length;
+      if (sd > maxSameDirSeen) maxSameDirSeen = sd;
+    }
+  }
+  settleUpTo(Infinity);
+
+  // 4) métricas
+  const round2 = v => Math.round(v * 100) / 100;
+  const wins = closed.filter(t => t.pnl > 0), losses = closed.filter(t => t.pnl <= 0);
+  const sum = arr => arr.reduce((s, t) => s + t.pnl, 0);
+  const avgWin = wins.length ? sum(wins) / wins.length : 0;
+  const avgLoss = losses.length ? -sum(losses) / losses.length : 0;
+  const totalPnl = capital - initialCapital;
+  const byPair = {};
+  for (const t of closed) {
+    const b = byPair[t.pair] || (byPair[t.pair] = { ops: 0, ganadas: 0, neto: 0 });
+    b.ops++; if (t.pnl > 0) b.ganadas++; b.neto = round2(b.neto + t.pnl);
+  }
+  const byReason = {};
+  for (const t of closed) byReason[t.reason] = (byReason[t.reason] || 0) + 1;
+
+  // Monte Carlo (semilla fija 19 → reproducible): remuestrea las operaciones con reemplazo
+  let monteCarlo = null;
+  if (mcRuns > 0 && closed.length >= 10) {
+    let s = 19;
+    const rnd = () => { s |= 0; s = (s + 0x6D2B79F5) | 0; let x = Math.imul(s ^ (s >>> 15), 1 | s); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+    const pn = closed.map(t => t.pnl), n = pn.length;
+    const nets = [], dds = [];
+    for (let r = 0; r < mcRuns; r++) {
+      let c = initialCapital, pk = c, md = 0;
+      for (let k = 0; k < n; k++) { c += pn[Math.floor(rnd() * n)]; if (c > pk) pk = c; const d = (pk - c) / pk; if (d > md) md = d; }
+      nets.push(c - initialCapital); dds.push(md);
+    }
+    nets.sort((x, y) => x - y); dds.sort((x, y) => x - y);
+    const q = (arr, p) => arr[Math.min(arr.length - 1, Math.floor(p * arr.length))];
+    monteCarlo = { corridas: mcRuns, probGanar: round2(nets.filter(v => v > 0).length / mcRuns * 100), netoP5: round2(q(nets, 0.05)), netoMediana: round2(q(nets, 0.5)), netoP95: round2(q(nets, 0.95)), caidaMedianaPct: round2(q(dds, 0.5) * 100), caidaP95Pct: round2(q(dds, 0.95) * 100) };
+  }
+
+  return {
+    escenario: { pares: pairs, dias: days, minAdx4h, corrMode, corrThreshold: corrThr, maxOpenRiskPct, maxSameDirection: maxSameDir, dailyLossLimitPct: dailyLossPct, dailyGainLimitPct: dailyGainPct, cooldownMinutes: cooldownMin, riskPerTradePct, slippagePct: config.slippagePct || 0, mode4h: MODE_4H, minRR, maxTradesPerDay: maxOpensPerDay, excluidos: Array.from(excluded) },
+    operaciones: closed.length, ganadas: wins.length, perdidas: losses.length,
+    winRate: closed.length ? round2(wins.length / closed.length * 100) : 0,
+    puntoEquilibrioWinRate: (avgWin + avgLoss) > 0 ? round2(avgLoss / (avgWin + avgLoss) * 100) : null,
+    gananciaPromedio: round2(avgWin), perdidaPromedio: round2(avgLoss),
+    factorGanancia: avgLoss > 0 && losses.length ? round2(sum(wins) / -sum(losses)) : null,
+    expectativaPorOperacion: closed.length ? round2(totalPnl / closed.length) : 0,
+    capitalInicial: initialCapital, capitalFinal: round2(capital), neto: round2(totalPnl), retornoPct: round2(totalPnl / initialCapital * 100),
+    caidaMaximaPct: round2(maxDD * 100),
+    simultaneas: { maximoAbiertas: maxConcurrent, maximoMismoLado: maxSameDirSeen },
+    senalesVistas: signalsSeen, bloqueadas: blocked, notaBloqueadas: 'Cuenta velas con señal frenada: una misma señal puede contarse varias veces (se repite vela a vela). Sirve para ver QUÉ filtro frena más, no para contar señales únicas.',
+    porPar: byPair, porMotivo: byReason, monteCarlo,
+    tradeList: config.includeTrades ? closed.map(t => ({ par: t.pair, lado: t.signal, abre: new Date(t.entryTime).toISOString(), cierra: new Date(t.exitTime).toISOString(), pnl: round2(t.pnl), motivo: t.reason })) : undefined
+  };
+}
+
+app.post('/backtest-cartera', async (req, res) => {
+  try {
+    const result = await runPortfolioBacktest(req.body || {});
+    res.json({ success: true, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;

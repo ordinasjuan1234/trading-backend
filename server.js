@@ -3553,6 +3553,10 @@ async function runPortfolioBacktest(config) {
   const loserExtendHours = config.loserExtendHours || null;
   const mcRuns = config.mcRuns ?? 2000;
   const excluded = new Set(config.excludePairs || []);
+  // PASO9 (solo backtest, apagado por defecto): variantes de SALIDA para medir si conviene cambiarlas.
+  const tpMaxR = config.tpMaxR || null;              // recorta el TP a como máximo N veces la distancia al SL (ej. 1 = objetivo de 1R)
+  const beAtR = config.beAtR || null;                // cuando el precio llega a +N R, el SL pasa a break-even (efecto desde la vela siguiente)
+  const beBuf = (config.beBufferPct ?? 0.1) / 100;   // el break-even queda este % a favor de la entrada (cubre comisión)
   const pairs = (config.pairs || PORTFOLIO_PAIRS).filter(p => !excluded.has(p));
   const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
   const WIN_MAIN = 60, WIN_4H = 40, MIN_HISTORY = 60;
@@ -3644,7 +3648,9 @@ async function runPortfolioBacktest(config) {
       signalsSeen++;
 
       // ── filtros (cada uno cuenta cuántas señales frena) ──
-      const entry = a.entry, tp = a.tp, sl = a.sl, signal = a.signal;
+      const entry = a.entry, sl = a.sl, signal = a.signal;
+      let tp = a.tp;
+      if (tpMaxR) { const capTp = signal === 'COMPRAR' ? entry + tpMaxR * Math.abs(entry - sl) : entry - tpMaxR * Math.abs(entry - sl); tp = signal === 'COMPRAR' ? Math.min(tp, capTp) : Math.max(tp, capTp); }
       if (config.applyMinEdgeFilter !== false && Math.abs(tp - entry) / entry < 0.006) { blocked.edgeMinimo++; continue; }
       if (minRR && a.rr < minRR) { blocked.rrMinimo++; continue; }
       if (dailyLossPct > 0 && dailyPnl <= -(capital * dailyLossPct / 100)) { blocked.limiteDiarioPerdida++; continue; }
@@ -3681,15 +3687,16 @@ async function runPortfolioBacktest(config) {
       const dir = signal === 'COMPRAR' ? 1 : -1;
       const entryFill = entry * (1 + dir * slip);
       let exitPrice = null, reason = null, extended = false, barsOpen = 0, lastJ = i;
+      let slCur = sl, movedBE = false;
       let mfe = 0, mae = 0, barsToMfe = 0; // PASO8: recorrido máximo a favor / en contra (solo informe, no afecta la estrategia)
       for (let j = i + 1; j < ps.main.length && barsOpen < (extended ? EXT_BARS : MAX_BARS); j++) {
         const c = ps.main[j];
         barsOpen++; lastJ = j;
         if (signal === 'COMPRAR') {
-          if (c.low <= sl) { exitPrice = sl * (1 - slip); reason = 'SL'; break; }
+          if (c.low <= slCur) { exitPrice = slCur * (1 - slip); reason = movedBE ? 'SL (BE)' : 'SL'; break; }
           if (c.high >= tp) { exitPrice = tp; reason = 'TP'; break; }
         } else {
-          if (c.high >= sl) { exitPrice = sl * (1 + slip); reason = 'SL'; break; }
+          if (c.high >= slCur) { exitPrice = slCur * (1 + slip); reason = movedBE ? 'SL (BE)' : 'SL'; break; }
           if (c.low <= tp) { exitPrice = tp; reason = 'TP'; break; }
         }
         {
@@ -3697,6 +3704,10 @@ async function runPortfolioBacktest(config) {
           const adv = signal === 'COMPRAR' ? (entryFill - c.low) / entryFill : (c.high - entryFill) / entryFill;
           if (fav > mfe) { mfe = fav; barsToMfe = barsOpen; }
           if (adv > mae) mae = adv;
+        }
+        if (beAtR && !movedBE) {
+          const trig = signal === 'COMPRAR' ? entry + beAtR * Math.abs(entry - sl) : entry - beAtR * Math.abs(entry - sl);
+          if (signal === 'COMPRAR' ? c.high >= trig : c.low <= trig) { slCur = entry * (1 + dir * beBuf); movedBE = true; }
         }
         if (barsOpen === MAX_BARS - 1 && !extended) {
           const losing = signal === 'COMPRAR' ? c.close < entry : c.close > entry;
@@ -3753,7 +3764,7 @@ async function runPortfolioBacktest(config) {
   }
 
   return {
-    escenario: { pares: pairs, dias: days, minAdx4h, corrMode, corrThreshold: corrThr, maxOpenRiskPct, maxSameDirection: maxSameDir, dailyLossLimitPct: dailyLossPct, dailyGainLimitPct: dailyGainPct, cooldownMinutes: cooldownMin, riskPerTradePct, slippagePct: config.slippagePct || 0, mode4h: MODE_4H, minRR, maxTradesPerDay: maxOpensPerDay, excluidos: Array.from(excluded) },
+    escenario: { pares: pairs, dias: days, minAdx4h, corrMode, corrThreshold: corrThr, maxOpenRiskPct, maxSameDirection: maxSameDir, dailyLossLimitPct: dailyLossPct, dailyGainLimitPct: dailyGainPct, cooldownMinutes: cooldownMin, riskPerTradePct, slippagePct: config.slippagePct || 0, mode4h: MODE_4H, minRR, maxTradesPerDay: maxOpensPerDay, excluidos: Array.from(excluded), tpMaxR, beAtR, beBufferPct: config.beBufferPct ?? 0.1 },
     operaciones: closed.length, ganadas: wins.length, perdidas: losses.length,
     winRate: closed.length ? round2(wins.length / closed.length * 100) : 0,
     puntoEquilibrioWinRate: (avgWin + avgLoss) > 0 ? round2(avgLoss / (avgWin + avgLoss) * 100) : null,

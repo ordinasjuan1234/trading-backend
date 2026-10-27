@@ -3961,6 +3961,219 @@ app.post('/backtest-donchian', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// (27/10/2026) BACKTEST "RANGO 4h" — Paso 10. Solo MEDICIÓN, el bot en vivo no cambia.
+// Idea de Juan: operar el mercado LATERAL (donde Estructura se apaga por el filtro ADX).
+// Estrategia de reversión a la media, REGLAS FIJADAS ANTES DE MIRAR RESULTADOS (no ajustar):
+//  · Régimen lateral: ADX(14) de 4h < adxMax (20).
+//  · Compra: el cierre de la vela 4h toca/rompe la banda de Bollinger inferior (20, 2σ) Y RSI(14) < 30.
+//  · Venta (corto): cierre en/por encima de la banda superior Y RSI > 70 (se puede apagar con longOnly).
+//  · Se ejecuta en la APERTURA de la vela siguiente (nunca al mismo precio de la señal).
+//  · Objetivo (TP): la media de 20 velas (banda central) al momento de la señal. Se ignora la señal si el TP queda a menos de 0,6% (los costos se lo comerían).
+//  · Stop: 1,5 × ATR(14). En una misma vela se revisa el STOP primero (conservador). Si abre más allá del stop, se llena a la apertura.
+//  · Salida por tiempo: 24 velas de 4h (4 días) al cierre.
+//  · Riesgo 0,75% por operación, una posición por par, comisión 0,1% por lado + slippage.
+// Incluye la referencia comprar-y-mantener y la caída máxima "a mercado".
+// ─────────────────────────────────────────────────────────────────────────────
+function rangoAdxSeries(hi, lo, cl, p) {
+  const n = hi.length, out = new Array(n).fill(null);
+  let trS = 0, pS = 0, mS = 0, dxSum = 0, dxCount = 0, adx = null;
+  for (let i = 1; i < n; i++) {
+    const up = hi[i] - hi[i - 1], dn = lo[i - 1] - lo[i];
+    const pdm = up > dn && up > 0 ? up : 0, mdm = dn > up && dn > 0 ? dn : 0;
+    const tr = Math.max(hi[i] - lo[i], Math.abs(hi[i] - cl[i - 1]), Math.abs(lo[i] - cl[i - 1]));
+    if (i <= p) { trS += tr; pS += pdm; mS += mdm; }
+    else { trS = trS - trS / p + tr; pS = pS - pS / p + pdm; mS = mS - mS / p + mdm; }
+    if (i >= p && trS > 0) {
+      const pdi = 100 * pS / trS, mdi = 100 * mS / trS;
+      const dx = (pdi + mdi) === 0 ? 0 : 100 * Math.abs(pdi - mdi) / (pdi + mdi);
+      if (dxCount < p) { dxSum += dx; dxCount++; if (dxCount === p) adx = dxSum / p; }
+      else adx = (adx * (p - 1) + dx) / p;
+      if (adx !== null) out[i] = adx;
+    }
+  }
+  return out;
+}
+
+async function runRangeBacktest(config) {
+  const days = config.days || 180;
+  const bbN = config.bbN || 20, bbK = config.bbK || 2;
+  const rsiN = 14, rsiLo = config.rsiLo ?? 30, rsiHi = config.rsiHi ?? 70;
+  const adxN = 14, adxMax = config.adxMax ?? 20;
+  const atrN = 14, atrMult = config.atrMult || 1.5;
+  const maxBars = config.maxBars || 24;
+  const minTpPct = (config.minTpPct ?? 0.6) / 100;
+  const longOnly = !!config.longOnly;
+  const initialCapital = config.initialCapital ?? 1000;
+  const riskPerTradePct = config.riskPerTradePct ?? 0.75;
+  const slip = (config.slippagePct ?? 0.05) / 100;
+  const COMMISSION_PCT = 0.001;
+  const maxOpenRiskPct = config.maxOpenRiskPct || null;
+  const maxSameDir = config.maxSameDirection || null;
+  const mcRuns = config.mcRuns ?? 2000;
+  const excluded = new Set(config.excludePairs || []);
+  const pairs = (config.pairs || PORTFOLIO_PAIRS).filter(p => !excluded.has(p));
+  const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
+  const WARM = Math.max(bbN, rsiN + 1, adxN * 2 + 1, atrN) + 2;
+  const fetchDays = days + Math.ceil(WARM / 6) + 5;
+  const cap = Math.min(fetchDays * 6 + 20, 20000);
+
+  const states = [];
+  for (const pair of pairs) {
+    const rawMain = await getCandlesCached(pair, '4h', fetchDays, cap, endTimeOverride, config.endDate);
+    const needBars = fetchDays * 6 + 6;
+    const main = rawMain.length > needBars ? rawMain.slice(rawMain.length - needBars) : rawMain;
+    const n = main.length;
+    const hi = main.map(c => c.high), lo = main.map(c => c.low), cl = main.map(c => c.close);
+    const sma = new Array(n).fill(null), up = new Array(n).fill(null), dn = new Array(n).fill(null);
+    for (let i = bbN - 1; i < n; i++) {
+      let s = 0; for (let k = i - bbN + 1; k <= i; k++) s += cl[k];
+      const m = s / bbN; let v = 0; for (let k = i - bbN + 1; k <= i; k++) v += (cl[k] - m) * (cl[k] - m);
+      const sd = Math.sqrt(v / bbN); sma[i] = m; up[i] = m + bbK * sd; dn[i] = m - bbK * sd;
+    }
+    const rsi = new Array(n).fill(null); let ag = 0, al = 0;
+    for (let i = 1; i < n; i++) {
+      const d = cl[i] - cl[i - 1], g = d > 0 ? d : 0, l = d < 0 ? -d : 0;
+      if (i <= rsiN) { ag += g; al += l; if (i === rsiN) { ag /= rsiN; al /= rsiN; rsi[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al); } }
+      else { ag = (ag * (rsiN - 1) + g) / rsiN; al = (al * (rsiN - 1) + l) / rsiN; rsi[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al); }
+    }
+    const atr = new Array(n).fill(null); let trSum = 0;
+    for (let i = 1; i < n; i++) {
+      const tr = Math.max(hi[i] - lo[i], Math.abs(hi[i] - cl[i - 1]), Math.abs(lo[i] - cl[i - 1]));
+      if (i <= atrN) { trSum += tr; if (i === atrN) atr[i] = trSum / atrN; } else atr[i] = (atr[i - 1] * (atrN - 1) + tr) / atrN;
+    }
+    const adx = rangoAdxSeries(hi, lo, cl, adxN);
+    const idx = new Map(); main.forEach((c, k) => idx.set(c.time, k));
+    states.push({ pair, main, hi, lo, cl, sma, up, dn, rsi, atr, adx, idx, pos: null, pendingEntry: null, lastClose: null, startClose: null });
+  }
+  const tStart = Math.max(...states.map(s => s.main[Math.min(WARM, s.main.length - 1)].time));
+  const times = Array.from(new Set(states.flatMap(s => s.main.map(c => c.time)))).sort((a, b) => a - b).filter(t => t >= tStart);
+
+  let capital = initialCapital, peak = initialCapital, maxDD = 0, seq = 0, maxConcurrent = 0, senales = 0;
+  const closed = [];
+  const blocked = { riesgoAgregado: 0, mismaDireccion: 0, sizing: 0, tpInvalido: 0, tpMuyCerca: 0 };
+  const bhIdx = [];
+
+  function closePos(s, exitPrice, t, reason) {
+    const p = s.pos;
+    const pricePct = p.dir === 1 ? (exitPrice - p.entryFill) / p.entryFill : (p.entryFill - exitPrice) / p.entryFill;
+    const pnl = p.size * pricePct - p.size * COMMISSION_PCT * 2;
+    capital += pnl;
+    closed.push({ pair: s.pair, signal: p.dir === 1 ? 'COMPRAR' : 'VENDER', entryTime: p.entryTime, exitTime: t, pnl, size: p.size, riskUsd: p.riskUsd, reason, horas: (t - p.entryTime) / 3600000, entrada: p.entryFill, stop: p.stop, tp: p.tp });
+    s.pos = null;
+  }
+
+  for (const t of times) {
+    for (const s of states) {
+      const i = s.idx.get(t);
+      if (i === undefined || i < WARM) continue;
+      const c = s.main[i];
+      if (s.startClose === null) s.startClose = c.open;
+      // (1) entrada pendiente: se llena en la apertura de esta vela
+      if (!s.pos && s.pendingEntry) {
+        const pe = s.pendingEntry; s.pendingEntry = null;
+        const fill = c.open * (1 + pe.dir * slip);
+        const stop = fill - pe.dir * pe.atrStop;
+        const tpOk = pe.dir === 1 ? pe.tp > fill : pe.tp < fill;
+        if (!tpOk) blocked.tpInvalido++;
+        else {
+          const r = calcPositionSize({ capital, entry: fill, sl: stop, overrides: { riskPerTradePct } });
+          const open = states.filter(x => x.pos);
+          if (!r.ok) blocked.sizing++;
+          else if (maxSameDir && open.filter(x => x.pos.dir === pe.dir).length >= maxSameDir) blocked.mismaDireccion++;
+          else if (maxOpenRiskPct && open.reduce((a, x) => a + x.pos.riskUsd, 0) + r.riskUsd > capital * maxOpenRiskPct / 100 + 1e-9) blocked.riesgoAgregado++;
+          else {
+            s.pos = { dir: pe.dir, entryFill: fill, stop, tp: pe.tp, size: r.size, riskUsd: r.riskUsd, entryTime: t, seq: ++seq, bars: 0 };
+            const nOpen = states.filter(x => x.pos).length; if (nOpen > maxConcurrent) maxConcurrent = nOpen;
+          }
+        }
+      }
+      // (2) dentro de la vela: STOP primero (conservador), después objetivo; salida por tiempo al cierre
+      if (s.pos) {
+        const p = s.pos; p.bars++;
+        if (p.dir === 1) {
+          if (c.low <= p.stop) closePos(s, Math.min(c.open, p.stop) * (1 - slip), t, 'Stop ATR');
+          else if (c.high >= p.tp) closePos(s, Math.max(c.open, p.tp), t, 'Objetivo (media)');
+        } else {
+          if (c.high >= p.stop) closePos(s, Math.max(c.open, p.stop) * (1 + slip), t, 'Stop ATR');
+          else if (c.low <= p.tp) closePos(s, Math.min(c.open, p.tp), t, 'Objetivo (media)');
+        }
+        if (s.pos && s.pos.bars >= maxBars) closePos(s, c.close * (1 - s.pos.dir * slip), t, 'Tiempo');
+      }
+      s.lastClose = c.close;
+      // (3) señal al CIERRE de esta vela → se ejecuta en la próxima
+      if (!s.pos && !s.pendingEntry && i + 1 < s.main.length && s.atr[i] !== null && s.adx[i] !== null && s.sma[i] !== null && s.rsi[i] !== null) {
+        if (s.adx[i] < adxMax) {
+          let dir = 0;
+          if (c.close <= s.dn[i] && s.rsi[i] < rsiLo) dir = 1;
+          else if (!longOnly && c.close >= s.up[i] && s.rsi[i] > rsiHi) dir = -1;
+          if (dir) {
+            senales++;
+            if (Math.abs(s.sma[i] - c.close) / c.close < minTpPct) blocked.tpMuyCerca++;
+            else s.pendingEntry = { dir, atrStop: s.atr[i] * atrMult, tp: s.sma[i] };
+          }
+        }
+      }
+    }
+    let eq = capital;
+    for (const s of states) if (s.pos && s.lastClose !== null) { const p = s.pos; eq += p.size * (p.dir === 1 ? (s.lastClose - p.entryFill) / p.entryFill : (p.entryFill - s.lastClose) / p.entryFill); }
+    if (eq > peak) peak = eq;
+    const dd = (peak - eq) / peak; if (dd > maxDD) maxDD = dd;
+    const rel = states.filter(s => s.startClose !== null && s.lastClose !== null).map(s => s.lastClose / s.startClose);
+    if (rel.length === states.length) bhIdx.push(rel.reduce((a, b) => a + b, 0) / rel.length);
+  }
+  const abiertasAlFinal = states.filter(s => s.pos).map(s => ({ par: s.pair, lado: s.pos.dir === 1 ? 'COMPRAR' : 'VENDER', desde: new Date(s.pos.entryTime).toISOString().slice(0, 10) }));
+  for (const s of states) if (s.pos) closePos(s, s.lastClose * (1 - s.pos.dir * slip), times[times.length - 1], 'Fin del período');
+
+  const round2 = v => Math.round(v * 100) / 100;
+  const wins = closed.filter(t => t.pnl > 0), losses = closed.filter(t => t.pnl <= 0);
+  const sum = a => a.reduce((x, t) => x + t.pnl, 0);
+  const avgWin = wins.length ? sum(wins) / wins.length : 0, avgLoss = losses.length ? -sum(losses) / losses.length : 0;
+  const totalPnl = capital - initialCapital;
+  const byPair = {}; for (const t of closed) { const b = byPair[t.pair] || (byPair[t.pair] = { ops: 0, ganadas: 0, neto: 0 }); b.ops++; if (t.pnl > 0) b.ganadas++; b.neto = round2(b.neto + t.pnl); }
+  const byReason = {}; for (const t of closed) byReason[t.reason] = (byReason[t.reason] || 0) + 1;
+  const bySide = {}; for (const t of closed) { const b = bySide[t.signal] || (bySide[t.signal] = { ops: 0, ganadas: 0, neto: 0 }); b.ops++; if (t.pnl > 0) b.ganadas++; b.neto = round2(b.neto + t.pnl); }
+  let bh = null;
+  if (bhIdx.length > 2) {
+    let pk = bhIdx[0], md = 0; for (const v of bhIdx) { if (v > pk) pk = v; const d = (pk - v) / pk; if (d > md) md = d; }
+    const ret = (bhIdx[bhIdx.length - 1] - 1 - 2 * COMMISSION_PCT) * 100;
+    bh = { retornoPct: round2(ret), caidaMaxPct: round2(md * 100) };
+  }
+  let monteCarlo = null;
+  if (mcRuns > 0 && closed.length >= 10) {
+    let sd = 19; const rnd = () => { sd |= 0; sd = (sd + 0x6D2B79F5) | 0; let x = Math.imul(sd ^ (sd >>> 15), 1 | sd); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+    const pn = closed.map(t => t.pnl), n = pn.length, nets = [];
+    for (let r = 0; r < mcRuns; r++) { let cc = initialCapital; for (let k = 0; k < n; k++) cc += pn[Math.floor(rnd() * n)]; nets.push(cc - initialCapital); }
+    nets.sort((a, b) => a - b);
+    const q = (a, p) => a[Math.min(a.length - 1, Math.floor(p * a.length))];
+    monteCarlo = { corridas: mcRuns, probGanar: round2(nets.filter(v => v > 0).length / mcRuns * 100), netoP5: round2(q(nets, 0.05)), netoMediana: round2(q(nets, 0.5)), netoP95: round2(q(nets, 0.95)) };
+  }
+  const periodo = times.length ? { desde: new Date(times[0]).toISOString().slice(0, 10), hasta: new Date(times[times.length - 1]).toISOString().slice(0, 10) } : null;
+  return {
+    estrategia: { tipo: 'Rango 4h (reversión a la media)', bbN, bbK, rsiLo, rsiHi, adxMax, atrMult, maxBars, minTpPct: minTpPct * 100, longOnly, riskPerTradePct, slippagePct: slip * 100, comisionPorLado: 0.1, maxOpenRiskPct, maxSameDirection: maxSameDir, pares: pairs, excluidos: Array.from(excluded) },
+    periodo,
+    senalesVistas: senales,
+    operaciones: closed.length, ganadas: wins.length, perdidas: losses.length,
+    winRate: closed.length ? round2(wins.length / closed.length * 100) : 0,
+    puntoEquilibrioWinRate: (avgWin + avgLoss) > 0 ? round2(avgLoss / (avgWin + avgLoss) * 100) : null,
+    gananciaPromedio: round2(avgWin), perdidaPromedio: round2(avgLoss),
+    factorGanancia: losses.length && avgLoss > 0 ? round2(sum(wins) / -sum(losses)) : null,
+    duracionPromedioHoras: closed.length ? round2(closed.reduce((a, t) => a + t.horas, 0) / closed.length) : 0,
+    capitalInicial: initialCapital, capitalFinal: round2(capital), neto: round2(totalPnl), retornoPct: round2(totalPnl / initialCapital * 100),
+    caidaMaximaMercadoPct: round2(maxDD * 100),
+    simultaneas: { maximoAbiertas: maxConcurrent }, bloqueadas: blocked,
+    comprarYMantener: bh,
+    abiertasAlFinal,
+    porPar: byPair, porLado: bySide, porMotivo: byReason, monteCarlo,
+    tradeList: config.includeTrades ? closed.map(t => ({ par: t.pair, lado: t.signal, abre: new Date(t.entryTime).toISOString(), cierra: new Date(t.exitTime).toISOString(), pnl: round2(t.pnl), motivo: t.reason, entrada: t.entrada, stop: t.stop, tp: t.tp })) : undefined
+  };
+}
+
+app.post('/backtest-rango', async (req, res) => {
+  try { res.json({ success: true, result: await runRangeBacktest(req.body || {}) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001;

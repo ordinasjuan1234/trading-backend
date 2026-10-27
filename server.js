@@ -3681,6 +3681,7 @@ async function runPortfolioBacktest(config) {
       const dir = signal === 'COMPRAR' ? 1 : -1;
       const entryFill = entry * (1 + dir * slip);
       let exitPrice = null, reason = null, extended = false, barsOpen = 0, lastJ = i;
+      let mfe = 0, mae = 0, barsToMfe = 0; // PASO8: recorrido máximo a favor / en contra (solo informe, no afecta la estrategia)
       for (let j = i + 1; j < ps.main.length && barsOpen < (extended ? EXT_BARS : MAX_BARS); j++) {
         const c = ps.main[j];
         barsOpen++; lastJ = j;
@@ -3691,6 +3692,12 @@ async function runPortfolioBacktest(config) {
           if (c.high >= sl) { exitPrice = sl * (1 + slip); reason = 'SL'; break; }
           if (c.low <= tp) { exitPrice = tp; reason = 'TP'; break; }
         }
+        {
+          const fav = signal === 'COMPRAR' ? (c.high - entryFill) / entryFill : (entryFill - c.low) / entryFill;
+          const adv = signal === 'COMPRAR' ? (entryFill - c.low) / entryFill : (c.high - entryFill) / entryFill;
+          if (fav > mfe) { mfe = fav; barsToMfe = barsOpen; }
+          if (adv > mae) mae = adv;
+        }
         if (barsOpen === MAX_BARS - 1 && !extended) {
           const losing = signal === 'COMPRAR' ? c.close < entry : c.close > entry;
           if (EXT_BARS > MAX_BARS && losing) { extended = true; continue; }
@@ -3699,9 +3706,12 @@ async function runPortfolioBacktest(config) {
         if (extended && barsOpen === EXT_BARS - 1) { exitPrice = c.close * (1 - dir * slip); reason = 'Tiempo (extendida)'; }
       }
       if (exitPrice === null) { blocked.sinSalida++; continue; } // sin datos suficientes hacia adelante
+      // la vela que toca SL/TP aporta solo su lado conocido (conservador)
+      if (reason === 'SL') mae = Math.max(mae, Math.abs(sl - entryFill) / entryFill);
+      if (reason === 'TP') mfe = Math.max(mfe, Math.abs(tp - entryFill) / entryFill);
       const pricePct = signal === 'COMPRAR' ? (exitPrice - entryFill) / entryFill : (entryFill - exitPrice) / entryFill;
       const pnl = size * pricePct - size * COMMISSION_PCT * 2;
-      open.push({ pair: ps.pair, signal, entryTime: t, exitTime: ps.main[lastJ].time, pnl, size, riskUsd, reason, seq: ++seq });
+      open.push({ pair: ps.pair, signal, entryTime: t, exitTime: ps.main[lastJ].time, pnl, size, riskUsd, reason, seq: ++seq, entrada: entry, entradaEjec: entryFill, sl, tp, mfe, mae, barsToMfe });
       opensByDay[dT] = (opensByDay[dT] || 0) + 1;
       if (open.length > maxConcurrent) maxConcurrent = open.length;
       const sd = open.filter(p => p.signal === signal).length;
@@ -3755,7 +3765,7 @@ async function runPortfolioBacktest(config) {
     simultaneas: { maximoAbiertas: maxConcurrent, maximoMismoLado: maxSameDirSeen },
     senalesVistas: signalsSeen, bloqueadas: blocked, notaBloqueadas: 'Cuenta velas con señal frenada: una misma señal puede contarse varias veces (se repite vela a vela). Sirve para ver QUÉ filtro frena más, no para contar señales únicas.',
     porPar: byPair, porMotivo: byReason, monteCarlo,
-    tradeList: config.includeTrades ? closed.map(t => ({ par: t.pair, lado: t.signal, abre: new Date(t.entryTime).toISOString(), cierra: new Date(t.exitTime).toISOString(), pnl: round2(t.pnl), motivo: t.reason })) : undefined
+    tradeList: config.includeTrades ? closed.map(t => ({ par: t.pair, lado: t.signal, abre: new Date(t.entryTime).toISOString(), cierra: new Date(t.exitTime).toISOString(), pnl: round2(t.pnl), motivo: t.reason, entrada: t.entrada, entradaEjecutada: t.entradaEjec, sl: t.sl, tp: t.tp, distSlPct: round2(Math.abs(t.entrada - t.sl) / t.entrada * 100), distTpPct: round2(Math.abs(t.tp - t.entrada) / t.entrada * 100), maxFavorPct: round2(t.mfe * 100), maxContraPct: round2(t.mae * 100), velasHastaMaxFavor: t.barsToMfe, notaExcursion: 'Velas de 30m. La vela que toca SL o TP aporta solo su lado conocido (conservador).' })) : undefined
   };
 }
 
@@ -3801,7 +3811,11 @@ async function runDonchianBacktest(config) {
 
   const states = [];
   for (const pair of pairs) {
-    const main = await getCandlesCached(pair, '4h', fetchDays, cap, endTimeOverride, config.endDate);
+    const rawMain = await getCandlesCached(pair, '4h', fetchDays, cap, endTimeOverride, config.endDate);
+    // (25/10) Binance se pide de a 1000 velas y llega de más: recortamos para que "days" sea el período REAL pedido
+    // (antes, 365 días eran ~466 y las ventanas con endDate se pisaban entre sí).
+    const needBars = fetchDays * 6 + 6;
+    const main = rawMain.length > needBars ? rawMain.slice(rawMain.length - needBars) : rawMain;
     const n = main.length;
     const hi = main.map(c => c.high), lo = main.map(c => c.low), cl = main.map(c => c.close);
     const ema = new Array(n).fill(null);

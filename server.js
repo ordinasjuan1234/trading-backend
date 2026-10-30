@@ -4174,6 +4174,198 @@ app.post('/backtest-rango', async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// (30/10/2026) BACKTEST "MOMENTUM DIARIO con objetivo de volatilidad" — Paso 11. Solo MEDICIÓN.
+// No escribe en MongoDB, no llama a Telegram, no toca autoMode ni el estado del bot: solo calcula y devuelve.
+// Estrategia (solo largos, con efectivo), parámetros FIJOS fijados de antemano (la ruta NO los acepta por JSON):
+//  · Elegible si el retorno de 90 días (cierre de ayer vs. cierre de hace 90 días) es > 0; si no, peso 0 (efectivo).
+//  · Volatilidad anualizada = desvío estándar muestral (n-1) de los 30 retornos diarios previos × raíz(365).
+//  · Peso = min(1/9, 0,20 / (9 × vol anualizada)). Sin apalancamiento; lo que sobra queda en efectivo sin interés.
+//  · Cada 7 días: los pesos del día D se calculan solo con cierres hasta D-1 y se ejecutan en la APERTURA de D.
+//  · No se opera un par si el cambio de peso es < 2% del capital, SALVO entrada (0 → positivo) o salida total (positivo → 0).
+//  · Comisión 0,1% por lado + slippage (slippagePct) por lado, ambos sobre el monto operado.
+// ─────────────────────────────────────────────────────────────────────────────
+async function runMomentumBacktest(config) {
+  const MOMENTUM_DAYS = 90, VOL_DAYS = 30, TARGET_VOL_PCT = 20, REBAL_DAYS = 7, MIN_CHANGE_PCT = 2, N_UNIVERSE = 9, WARM_DAYS = 130;
+  const COMMISSION_PCT = 0.001, DAY = 86400000;
+  const days = Math.max(14, Math.min(Number(config.days) || 180, 1500));
+  const initialCapital = config.initialCapital ?? 1000;
+  const slip = (config.slippagePct ?? 0.05) / 100;
+  const mcRuns = config.mcRuns ?? 2000;
+  const excluded = new Set(config.excludePairs || []);
+  const pairs = (config.pairs || PORTFOLIO_PAIRS).filter(p => !excluded.has(p));
+  const endTimeOverride = config.endDate ? new Date(config.endDate).getTime() : undefined;
+  if (config.endDate && !Number.isFinite(endTimeOverride)) throw new Error('endDate inválida (usar YYYY-MM-DD)');
+  const notas = [];
+  for (const k of ['momentumDays', 'volDays', 'targetVolPct', 'rebalanceDays', 'minChangePct']) {
+    if (config[k] !== undefined) notas.push('Parámetro ' + k + ' ignorado: está fijado de antemano y no se puede cambiar.');
+  }
+  if (pairs.length !== N_UNIVERSE) notas.push('Se usaron ' + pairs.length + ' pares; el divisor del peso sigue siendo 9 (peso máximo 1/9 por par; lo que sobra queda en efectivo).');
+
+  // 1) datos diarios (con ≥ 120 días de calentamiento antes del período medido)
+  const fetchDays = days + WARM_DAYS;
+  const cap = Math.min(fetchDays + 20, 5000);
+  const data = {};
+  let tLast = -Infinity;
+  for (const pair of pairs) {
+    const raw = await getCandlesCached(pair, '1d', fetchDays, cap, endTimeOverride, config.endDate);
+    const arr = raw.filter(k => k.time + DAY <= Date.now()); // descarta la vela diaria todavía abierta
+    const m = new Map(arr.map(k => [k.time, k]));
+    data[pair] = m;
+    if (arr.length) tLast = Math.max(tLast, arr[arr.length - 1].time);
+    else notas.push(pair + ': sin velas diarias; queda en efectivo todo el período.');
+  }
+  if (!Number.isFinite(tLast)) throw new Error('Sin datos diarios para calcular');
+  const tStart = tLast - (days - 1) * DAY;
+  const dayTimes = []; for (let k = 0; k < days; k++) dayTimes.push(tStart + k * DAY);
+  const closeAt = (p, t) => { const c = data[p].get(t); return c ? c.close : null; };
+
+  // 2) simulación
+  const units = {}, flow = {}, ops = {}, lastClose = {}, noData = {};
+  pairs.forEach(p => { units[p] = 0; flow[p] = 0; ops[p] = 0; lastClose[p] = null; noData[p] = 0; });
+  let cash = initialCapital, peak = initialCapital, maxDD = 0, commTotal = 0, slipTotal = 0, tradedTotal = 0, rebalProg = 0, rebalConOrdenes = 0;
+  const trades = [], equitySeries = [], expoSeries = [];
+  let diasEfectivo = 0;
+
+  for (let k = 0; k < days; k++) {
+    const D = dayTimes[k];
+    const openOf = p => { const c = data[p].get(D); return c ? c.open : (lastClose[p] !== null ? lastClose[p] : null); };
+    if (k % REBAL_DAYS === 0) {
+      rebalProg++;
+      // pesos objetivo: solo con cierres hasta D-1
+      const w = {};
+      for (const p of pairs) {
+        const c1 = closeAt(p, D - DAY), c90 = closeAt(p, D - DAY - MOMENTUM_DAYS * DAY);
+        let ok = c1 !== null && c90 !== null;
+        const rets = [];
+        if (ok) {
+          for (let j = 1; j <= VOL_DAYS; j++) {
+            const a = closeAt(p, D - DAY * j), b = closeAt(p, D - DAY * (j + 1));
+            if (a === null || b === null) { ok = false; break; }
+            rets.push(a / b - 1);
+          }
+        }
+        if (!ok) { w[p] = 0; noData[p]++; continue; }
+        const mean = rets.reduce((s, v) => s + v, 0) / rets.length;
+        const sd = Math.sqrt(rets.reduce((s, v) => s + (v - mean) * (v - mean), 0) / (rets.length - 1));
+        const volAnual = sd * Math.sqrt(365);
+        const eligible = c1 / c90 - 1 > 0;
+        w[p] = !eligible ? 0 : Math.min(1 / N_UNIVERSE, volAnual > 0 ? (TARGET_VOL_PCT / 100) / (N_UNIVERSE * volAnual) : 1 / N_UNIVERSE);
+      }
+      // ejecución en la apertura de D
+      let eqOpen = cash;
+      for (const p of pairs) { const o = openOf(p); if (units[p] > 0 && o !== null) eqOpen += units[p] * o; }
+      const orders = [];
+      for (const p of pairs) {
+        const o = openOf(p); if (o === null) continue;
+        const cur = units[p] * o, target = w[p] * eqOpen, delta = target - cur;
+        const entering = units[p] === 0 && target > 0, exiting = units[p] > 0 && w[p] === 0;
+        if (!entering && !exiting && Math.abs(delta) / eqOpen * 100 < MIN_CHANGE_PCT) continue;
+        if (Math.abs(delta) < 1e-9) continue;
+        orders.push({ p, o, cur, target, delta, pesoAntes: eqOpen > 0 ? cur / eqOpen : 0 });
+      }
+      orders.sort((a, b) => a.delta - b.delta); // primero las ventas
+      let hizo = false;
+      for (const od of orders) {
+        let notional = Math.abs(od.delta);
+        const isBuy = od.delta > 0;
+        if (isBuy) { const maxN = cash / (1 + slip + COMMISSION_PCT); if (notional > maxN) notional = Math.max(0, maxN); }
+        else notional = Math.min(notional, units[od.p] * od.o);
+        if (notional <= 1e-9) continue;
+        const comm = notional * COMMISSION_PCT, sl = notional * slip;
+        if (isBuy) { units[od.p] += notional / od.o; cash -= notional + comm + sl; flow[od.p] -= notional + comm + sl; }
+        else { units[od.p] = od.target <= 0 || notional >= units[od.p] * od.o - 1e-9 ? 0 : units[od.p] - notional / od.o; cash += notional - comm - sl; flow[od.p] += notional - comm - sl; }
+        commTotal += comm; slipTotal += sl; tradedTotal += notional; ops[od.p]++; hizo = true;
+        trades.push({ par: od.p, fecha: new Date(D).toISOString().slice(0, 10), lado: isBuy ? 'COMPRAR' : 'VENDER', precioEjecucion: od.o * (1 + (isBuy ? 1 : -1) * slip), pesoAntesPct: Math.round(od.pesoAntes * 10000) / 100, pesoDespuesPct: Math.round(units[od.p] * od.o / eqOpen * 10000) / 100, costo: Math.round((comm + sl) * 10000) / 10000, montoOperado: Math.round(notional * 100) / 100 });
+      }
+      if (hizo) rebalConOrdenes++;
+    }
+    // valuación al cierre del día
+    let inv = 0;
+    for (const p of pairs) { const c = data[p].get(D); if (c) lastClose[p] = c.close; if (units[p] > 0 && lastClose[p] !== null) inv += units[p] * lastClose[p]; }
+    const eq = cash + inv;
+    equitySeries.push(eq); expoSeries.push(eq > 0 ? inv / eq : 0);
+    if (eq > peak) peak = eq;
+    const dd = (peak - eq) / peak; if (dd > maxDD) maxDD = dd;
+    if (!pairs.some(p => units[p] > 0)) diasEfectivo++;
+  }
+
+  // 3) métricas
+  const round2 = v => Math.round(v * 100) / 100;
+  const capitalFinal = equitySeries[equitySeries.length - 1];
+  const invFinal = pairs.reduce((s, p) => s + (units[p] > 0 && lastClose[p] !== null ? units[p] * lastClose[p] : 0), 0);
+  const capitalFinalSiLiquida = cash + invFinal * (1 - slip - COMMISSION_PCT);
+  const avgEq = equitySeries.reduce((a, b) => a + b, 0) / equitySeries.length;
+  const porPar = {};
+  for (const p of pairs) porPar[p] = { neto: round2(flow[p] + (units[p] > 0 && lastClose[p] !== null ? units[p] * lastClose[p] : 0)), operaciones: ops[p] };
+  for (const p of pairs) if (noData[p] > 0) notas.push(p + ': sin datos suficientes en ' + noData[p] + ' de ' + rebalProg + ' rebalanceos (quedó en efectivo en esos rebalanceos).');
+
+  // comprar y mantener: compra el primer día a la apertura y vende al final, con los mismos costos
+  function buyHold(list) {
+    const share = initialCapital / (list === pairs ? pairs.length : 1);
+    let investedUnits = {}, cashLeft = initialCapital;
+    const missing = [];
+    for (const p of list) {
+      const c0 = data[p].get(dayTimes[0]);
+      if (!c0) { missing.push(p); continue; }
+      const n = share / (1 + slip + COMMISSION_PCT);
+      investedUnits[p] = n / c0.open; cashLeft -= share;
+    }
+    let pk = initialCapital, md = 0, last = initialCapital; const lc = {};
+    for (let k = 0; k < days; k++) {
+      let v = cashLeft;
+      for (const p of Object.keys(investedUnits)) { const c = data[p].get(dayTimes[k]); if (c) lc[p] = c.close; if (lc[p] !== undefined) v += investedUnits[p] * lc[p]; }
+      last = v; if (v > pk) pk = v; const d = (pk - v) / pk; if (d > md) md = d;
+    }
+    let finalInv = 0; for (const p of Object.keys(investedUnits)) if (lc[p] !== undefined) finalInv += investedUnits[p] * lc[p];
+    const finalVal = cashLeft + finalInv * (1 - slip - COMMISSION_PCT);
+    return { retornoPct: round2((finalVal - initialCapital) / initialCapital * 100), caidaMaxPct: round2(md * 100), sinDatosPrimerDia: missing };
+  }
+  const bhAll = buyHold(pairs);
+  const bhBtc = pairs.includes('BTCUSDT') ? buyHold(['BTCUSDT']) : null;
+  if (!bhBtc) notas.push('comprarYMantener.soloBTC = null: BTCUSDT no está entre los pares usados.');
+  if (bhAll.sinDatosPrimerDia.length) notas.push('Comprar y mantener: ' + bhAll.sinDatosPrimerDia.join(', ') + ' no tenían velas el primer día; esa parte queda en efectivo.');
+
+  let monteCarlo = null;
+  if (mcRuns > 0) {
+    const weekly = [];
+    for (let k = REBAL_DAYS - 1; k < days; k += REBAL_DAYS) { const prev = k - REBAL_DAYS >= 0 ? equitySeries[k - REBAL_DAYS] : initialCapital; weekly.push(equitySeries[k] / prev); }
+    if (weekly.length >= 8) {
+      let s = 19; const rnd = () => { s |= 0; s = (s + 0x6D2B79F5) | 0; let x = Math.imul(s ^ (s >>> 15), 1 | s); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+      const nets = [];
+      for (let r = 0; r < mcRuns; r++) { let c = initialCapital; for (let i = 0; i < weekly.length; i++) c *= weekly[Math.floor(rnd() * weekly.length)]; nets.push(c - initialCapital); }
+      nets.sort((a, b) => a - b);
+      const q = p => nets[Math.min(nets.length - 1, Math.floor(p * nets.length))];
+      monteCarlo = { corridas: mcRuns, probGanar: round2(nets.filter(v => v > 0).length / mcRuns * 100), netoP5: round2(q(0.05)), netoMediana: round2(q(0.5)), netoP95: round2(q(0.95)), nota: 'Remuestreo de retornos semanales; con pocas semanas es una referencia débil.' };
+    } else notas.push('Monte Carlo no calculado: menos de 8 semanas en el período.');
+  }
+
+  return {
+    escenario: { tipo: 'Momentum diario con objetivo de volatilidad (solo largos, con efectivo)', pares: pairs, excluidos: Array.from(excluded), dias: days, endDate: config.endDate || null, initialCapital, slippagePct: slip * 100, comisionPorLado: 0.1,
+      fijos: { momentumDays: MOMENTUM_DAYS, volDays: VOL_DAYS, targetVolPct: TARGET_VOL_PCT, rebalanceDays: REBAL_DAYS, minChangePct: MIN_CHANGE_PCT, divisorPeso: N_UNIVERSE, volatilidad: 'desvío muestral (n-1) de 30 retornos diarios × raíz(365)', diasCalentamiento: WARM_DAYS } },
+    periodo: { desde: new Date(dayTimes[0]).toISOString().slice(0, 10), hasta: new Date(dayTimes[days - 1]).toISOString().slice(0, 10) },
+    capitalInicial: initialCapital, capitalFinal: round2(capitalFinal), neto: round2(capitalFinal - initialCapital), retornoPct: round2((capitalFinal - initialCapital) / initialCapital * 100),
+    capitalFinalSiLiquidaTodo: round2(capitalFinalSiLiquida), netoSiLiquidaTodo: round2(capitalFinalSiLiquida - initialCapital),
+    caidaMaximaEstrategiaPct: round2(maxDD * 100),
+    operaciones: trades.length, rebalanceosProgramados: rebalProg, rebalanceosConOrdenes: rebalConOrdenes,
+    diasEnEfectivoPct: round2(diasEfectivo / days * 100),
+    rotacion: round2(tradedTotal / avgEq),
+    costosPagados: { comision: round2(commTotal), slippage: round2(slipTotal), total: round2(commTotal + slipTotal) },
+    exposicionPromedioPct: round2(expoSeries.reduce((a, b) => a + b, 0) / expoSeries.length * 100),
+    exposicionMaximaPct: round2(Math.max(...expoSeries) * 100),
+    porPar,
+    comprarYMantener: { nuevePares: { retornoPct: bhAll.retornoPct, caidaMaxPct: bhAll.caidaMaxPct }, soloBTC: bhBtc ? { retornoPct: bhBtc.retornoPct, caidaMaxPct: bhBtc.caidaMaxPct } : null },
+    monteCarlo,
+    notas: notas.length ? notas : null,
+    tradeList: config.includeTrades ? trades : undefined
+  };
+}
+
+app.post('/backtest-momentum', async (req, res) => {
+  try { res.json({ success: true, result: await runMomentumBacktest(req.body || {}) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function runTendenciaSubfilterBacktest(pair, tf, days, config) {
   const { minConfidence, riskPct, initialCapital } = config;
   const COMMISSION_PCT = 0.001;
